@@ -1,0 +1,40 @@
+語音書寫 (voice_to_text)
+Copyright 2026 Hong-Wen Hsieh
+
+This product includes software developed by Hong-Wen Hsieh and is licensed under the
+Apache License, Version 2.0 (see the LICENSE file).
+
+Bundled third-party code
+------------------------
+voice_app/opencc.full.js is the OpenCC-JS 1.4.2 browser build (nk2028/opencc-js, MIT License),
+used for Traditional/Simplified Chinese conversion in the browser. Its license and the licenses of
+the dictionary data it embeds (OpenCC data, Apache-2.0) are in voice_app/OPENCC_LICENSE.txt and
+voice_app/OPENCC_THIRD_PARTY_LICENSES.md; the source and checksum are in voice_app/OPENCC_SOURCE.md.
+
+Third-party software and models (not included in this repository)
+------------------------------------------------------------------
+Apart from the file above, this repository contains no third-party code or model weights.
+setup.ps1 installs dependencies from their own distributions (PyPI, PyTorch) and downloads
+models from Hugging Face; each remains under its own license, which you must comply with.
+The main components and the licenses declared in their package metadata at the time of writing:
+
+  NiceGUI                              MIT
+  httpx                                BSD-3-Clause
+  SoundCard                            BSD-3-Clause
+  PyAV (av)                            BSD-3-Clause
+  NumPy                                BSD-3-Clause
+  PyTorch (torch)                      BSD-3-Clause
+  Hugging Face transformers            Apache-2.0
+  Hugging Face huggingface_hub         Apache-2.0
+  safetensors                          Apache-2.0
+  qwen-asr                             Apache-2.0
+
+  Qwen/Qwen3-ASR-1.7B                  Apache-2.0 (model weights, downloaded at install time)
+  Qwen/Qwen3-ForcedAligner-0.6B        Apache-2.0 (model weights, downloaded at install time)
+
+The full list of installed packages is pinned in constraints.txt (UI environment) and
+requirements-asr.txt (speech-recognition environment). Review the license of each package
+before redistributing a bundled copy of an installed environment.
+
+The proofreading step sends transcribed text to the OpenAI-compatible chat service you
+configure; the model and service you choose are subject to their own terms.

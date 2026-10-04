@@ -1,0 +1,8 @@
+.venv/
+.venv-asr/
+__pycache__/
+.pytest_cache/
+.pytest_tmp/
+data/
+models/
+*.log
