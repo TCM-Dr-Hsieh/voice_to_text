@@ -139,13 +139,17 @@ function Install-Python312 {
         if ($answer -match '^(n|no)$') { throw '已取消：需要 Python 3.12 才能繼續。' }
     }
     Write-Note '用 winget 安裝 Python 3.12 …'
-    & winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
+    # A PowerShell function RETURNS everything it writes to the pipeline, not just what follows `return`. winget's own
+    # output (the msstore agreement text, "Successfully installed ...") used to be returned together with the path, so
+    # $python became an array and the next step failed with "無法辨識 'The `msstore` source requires ...'". Out-Host
+    # still shows (and logs) the output but keeps it out of the return value.
+    & winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements | Out-Host
     # winget returns a non-zero code when it is already installed; what matters is whether we can find it now.
     $found = Find-Python312
     if (-not $found) {
         throw 'Python 3.12 安裝後仍找不到。請關閉這個視窗、重新開啟後再執行 setup.ps1。'
     }
-    return $found
+    return [string]$found
 }
 
 function Get-VenvHome([string]$venvDir) {
@@ -185,11 +189,14 @@ function Ensure-Venv([string]$dir, [string]$python, [bool]$mustBeStandalone) {
             return $venvPy
         }
     }
-    Invoke-Checked "建立 $dir" $python @('-m', 'venv', $dir)
-    return $venvPy
+    # Same rule as in Install-Python312: anything `python -m venv` prints must not become part of the returned path.
+    Invoke-Checked "建立 $dir" $python @('-m', 'venv', $dir) | Out-Host
+    return [string]$venvPy
 }
 
 function Install-Pip([string]$py, [string[]]$pipArguments) {
+    # Deliberately NOT piped to Out-Host: it is only ever called as a statement (its output is never captured), and a
+    # native command that is not piped keeps the console, so pip shows its live download progress bar.
     $all = @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '--retries', '10', '--timeout', '60') + $pipArguments
     & $py @all
     if ($LASTEXITCODE -ne 0) {
@@ -261,6 +268,11 @@ try {
     } else {
         $python = Find-Python312
         if (-not $python) { $python = Install-Python312 }
+    }
+    # Whatever got us here, $python must be exactly one path to a working Python 3.12 (a clear message beats a
+    # confusing "無法辨識 ..." from the next step if a function ever leaks output into its return value again).
+    if ($python -isnot [string] -or -not (Test-Python312 $python)) {
+        throw ("找到的 Python 3.12 無法使用：{0}。請用 -BasePython 指定 python.exe，或重新執行 setup.ps1。" -f (@($python) -join ' | '))
     }
     Write-Ok "Python 3.12：$python"
 

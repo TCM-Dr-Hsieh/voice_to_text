@@ -1,6 +1,8 @@
 """Install-time pieces: project-relative model paths, configure.py, download_models.py and modelcheck.py."""
 import hashlib
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -170,3 +172,41 @@ def test_check_mode_downloads_nothing_and_reports_missing_models(tmp_path, monke
     monkeypatch.setattr(sys, 'argv', ['download_models.py', '--check', '--dir', str(tmp_path / 'models')])
     assert download_models.main() == 1
     assert not (tmp_path / 'models').exists()
+
+
+# --- setup.ps1 (cannot be run here; guard the properties that broke before) -----------------------------
+def test_setup_script_keeps_its_utf8_bom_for_windows_powershell_5_1():
+    assert (ROOT / 'setup.ps1').read_bytes().startswith(b'\xef\xbb\xbf'), \
+        'without a BOM PowerShell 5.1 reads the Chinese text as ANSI'
+
+
+def test_setup_functions_return_one_value_even_when_a_native_command_prints():
+    """First install on a computer without Python 3.12: Install-Python312 ran winget, whose output rode along with the
+    returned path, so $python was an array and step 3 died with "無法辨識 'The `msstore` source requires ...'"; running
+    the script a second time worked because Python was found without winget. Ensure-Venv had the same latent flaw
+    (anything `python -m venv` printed would have become part of the returned venv path)."""
+    shell = shutil.which('powershell') or shutil.which('pwsh')
+    if not shell:
+        pytest.skip('找不到 PowerShell，略過 setup.ps1 的回傳值測試')
+    result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                             str(ROOT / 'tests' / 'setup_leak_probe.ps1'), '-Setup', str(ROOT / 'setup.ps1')],
+                            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
+    rows = {}
+    for line in result.stdout.splitlines():
+        if line.startswith('PROBE|'):
+            _, name, count, kind, value = (line.split('|', 4) + [''])[:5]
+            rows[name] = (int(count), kind, value)
+    assert set(rows) == {'install-python', 'install-python-already-installed', 'ensure-venv'}, \
+        result.stdout + result.stderr
+    for name in ('install-python', 'install-python-already-installed'):
+        count, kind, value = rows[name]
+        assert (count, kind) == (1, 'String'), f'{name} returned {count} items ({kind}): {value}'
+        assert value == r'C:\fake\Python312\python.exe'
+    count, kind, value = rows['ensure-venv']
+    assert (count, kind) == (1, 'String') and value.endswith(r'.venv\Scripts\python.exe'), value
+
+
+def test_setup_script_refuses_a_python_that_is_not_one_working_path():
+    text = (ROOT / 'setup.ps1').read_text(encoding='utf-8-sig')
+    assert '$python -isnot [string] -or -not (Test-Python312 $python)' in text      # a clear message, not 無法辨識 ...
+    assert text.index('$python -isnot [string]') < text.index('Write-Ok "Python 3.12：$python"')
