@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,24 @@ def reserve_meeting_path(directory: Path = MEETINGS_DIR, now: datetime | None = 
                 return path
         except FileExistsError:
             number += 1
+
+
+def clock(seconds: int) -> str:
+    """`02:01`, and `1:02:01` from an hour on."""
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes:02d}:{seconds:02d}'
+
+
+def segment_span(segment) -> str:
+    """Where in the audio the speech of a segment is: `02:01-02:04` (from the start of the recording; whole seconds that hold it).
+    A segment owns the audio the previous window did not cover, not its whole recognition window, which overlaps its neighbours."""
+    start = segment.owned_start if getattr(segment, 'owned_start', None) is not None else segment.start
+    first = math.floor(start)
+    last = max(first, math.ceil(segment.end))
+    if last >= 3600:                                    # an hour on, both ends have the hours (`0:59:59-1:00:02`)
+        return f'{first // 3600}:{clock(first % 3600)}-{last // 3600}:{clock(last % 3600)}'
+    return f'{clock(first)}-{clock(last)}'
 
 
 class Meeting:
@@ -300,7 +319,7 @@ class Meeting:
         return self._save_error
 
     def export_text(self) -> str:
-        """The bilingual text: each segment as `語音#n 名稱: 原文`, followed by its translation when there is one."""
+        """The bilingual text: each segment as `語音#n(02:01-02:04) 名稱: 原文`, followed by its translation when there is one."""
         speaker, translator = self.speaker, self.translator
         started = datetime.fromisoformat(self.created)
         lines = [f'會議紀錄　{started:%Y-%m-%d %H:%M}']
@@ -315,8 +334,9 @@ class Meeting:
             runs = speaker.runs(segment)
             if not runs:
                 continue
+            head = f'語音#{segment.index}({segment_span(segment)})'
             for k, run in enumerate(runs):
-                prefix = f'語音#{segment.index} ' if k == 0 else ' ' * (len(f'語音#{segment.index}') + 1)
+                prefix = f'{head} ' if k == 0 else ' ' * (len(head) + 1)
                 who = '[背景]' if run.background else f'{speaker.name_of(run.gid)}{"*" if run.source in ("text", "text2") else ""}'
                 lines.append(f'{prefix}{who}: {run.text}')
             result = translator.visible(segment.index)

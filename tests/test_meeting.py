@@ -7,7 +7,7 @@ import pytest
 from voice_app.api import RollingResult
 from voice_app.audio import Chunk, RATE
 from voice_app.config import Settings
-from voice_app.meeting import Meeting, reserve_meeting_path
+from voice_app.meeting import Meeting, clock, reserve_meeting_path, segment_span
 from voice_app.session import Session
 from voice_app.translation import Draft, Translated
 from tests.speaker_fakes import FakeEmbedder, bases, build, make_turns, window_of
@@ -124,7 +124,7 @@ async def test_ending_the_meeting_decides_the_last_sentences_unlocks_the_rows_an
         doc = json.loads(meeting.path.read_text(encoding='utf-8'))
         assert doc['ended'] is True and len(doc['segments']) == len(session.segments) and doc['speakers']['stats']['groups'] == 2
         text = meeting.path.with_suffix('.txt').read_text(encoding='utf-8-sig')
-        assert '語音#1 ' in text and 'Speaker-001' in text and 'Speaker-002' in text
+        assert '語音#1(00:00-00:06) ' in text and 'Speaker-001' in text and 'Speaker-002' in text
         assert meeting.save_error == ''
         await meeting.end()                                                          # a second call changes nothing
     finally:
@@ -148,8 +148,8 @@ async def test_the_bilingual_text_puts_each_translation_under_its_segment_with_t
         lines = text.splitlines()
         assert lines[0].startswith('會議紀錄') and '王先生' in lines[1] and 'Speaker-002' in lines[1]
         assert lines[2].startswith('翻譯語言：English')
-        first = next(i for i, line in enumerate(lines) if line.startswith('語音#1 '))
-        assert lines[first].startswith('語音#1 ') and ': ' in lines[first]
+        first = next(i for i, line in enumerate(lines) if line.startswith('語音#1('))
+        assert lines[first].startswith('語音#1(00:00-00:06) ') and ': ' in lines[first]
         assert any(line.startswith('Voice#1 ') for line in lines[first:first + 4])
         assert 'Mr. Wang' in text or gids[0] not in [r.gid for r in runs]
         assert 'Voice#2 ' not in text                                        # untranslated segments have only the source line
@@ -179,6 +179,44 @@ async def test_a_draft_translation_goes_to_the_page_as_one_text_and_into_the_bil
         row = next(r for r in meeting.drain()['rows'] if r['i'] == index)
         assert row['tr']['st'] == 'ok' and row['tr']['runs'][0]['t'] == 'T0'
         assert 'Hello there' not in meeting.export_text()
+    finally:
+        await meeting.close()
+
+
+def test_a_time_is_minutes_and_seconds_and_has_the_hours_from_an_hour_on():
+    assert [clock(x) for x in (0, 9, 121, 3599)] == ['00:00', '00:09', '02:01', '59:59']
+    assert [clock(x) for x in (3600, 3723)] == ['1:00:00', '1:02:03']
+    from types import SimpleNamespace as S
+    assert segment_span(S(owned_start=121.0, start=118.0, end=124.0)) == '02:01-02:04'          # (the window is 118-124, the segment owns 121-124)
+    assert segment_span(S(owned_start=57.0, start=54.0, end=61.5)) == '00:57-01:02'              # whole seconds that hold it
+    assert segment_span(S(owned_start=0.0, start=0.0, end=9.0)) == '00:00-00:09'
+    assert segment_span(S(owned_start=3599.2, start=3596.0, end=3602.0)) == '0:59:59-1:00:02'
+    assert segment_span(S(owned_start=None, start=30.0, end=39.0)) == '00:30-00:39'              # a segment made without it: its window
+    assert segment_span(S(owned_start=12.0, start=9.0, end=12.0)) == '00:12-00:12'
+
+
+@pytest.mark.asyncio
+async def test_the_bilingual_text_says_where_in_the_audio_each_segment_is_but_the_page_does_not(tmp_path):
+    meeting, session, play, count = fake_meeting(tmp_path, [0, 1] * 14)
+    try:
+        await play(0, count)
+        await meeting.end()
+        import re
+        lines = meeting.export_text().splitlines()
+        heads = [re.match(r'語音#(\d+)\((\d\d:\d\d)-(\d\d:\d\d)\) ', line) for line in lines if line.startswith('語音#')]
+        assert heads and all(heads)
+        seen = [(int(m[1]), m[2], m[3]) for m in heads]
+        assert seen[0] == (1, '00:00', '00:06')
+        for (_, _, before_end), (_, start, _) in zip(seen, seen[1:]):
+            assert start == before_end                                                    # each segment starts where the one before it ended
+        assert [segment.owned_start for segment in session.segments[:3]] == [0.0, 6.0, 9.0]    # (windows of 6 s every 3 s)
+        update = meeting.drain()
+        assert update and update['rows']
+        assert 'span' not in json.dumps(update) and 'owned_start' not in json.dumps(update)   # the page is not given times
+        many = next(index for index in range(1, len(session.segments) + 1) if len(meeting.speaker.runs(session.segments[index - 1])) > 1)
+        at = next(i for i, line in enumerate(lines) if line.startswith(f'語音#{many}('))
+        head = lines[at].split(' ')[0]
+        assert lines[at + 1].startswith(' ' * (len(head) + 1)) and '(' not in lines[at + 1].split(':')[0]       # only the first line has the time
     finally:
         await meeting.close()
 

@@ -354,6 +354,7 @@ async def test_skipped_window_protects_next_rolling_edit_start(monkeypatch):
     await session.task
     assert session.gaps[0].reason == 'window'
     assert WindowAPI.protected == [True]
+    assert session.segments[0].owned_start == 12 and session.segments[0].start == 9        # it owns what comes after the skipped window
 
 
 def test_settings_roundtrip_and_validation(tmp_path):

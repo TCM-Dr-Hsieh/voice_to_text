@@ -34,6 +34,7 @@ class Segment:
     alignment: list = field(default_factory=list)
     edits: list = field(default_factory=list)
     added_conv: str = ''          # meeting mode: `added` in Traditional script (the text the speaker marks are placed on)
+    owned_start: float | None = None    # the audio this segment owns is `owned_start` to `end`: what the previous window did not cover
 
 
 @dataclass
@@ -321,7 +322,8 @@ class Session:
         warning = ''
         candidate = Segment(len(self.segments) + 1, chunk.start, end, raw, added, added_conv or added,
                             time.monotonic() - started, warning, chunk.reason,
-                            [asdict(unit) for unit in units], added_conv=added_conv)
+                            [asdict(unit) for unit in units], added_conv=added_conv,
+                            owned_start=max(self.committed_end, chunk.start))
         recent_start = max(self.rolling_start, len(self.segments) - 2)
         recent = self.segments[recent_start:] + [candidate]
         before = [segment.corrected_tail for segment in recent]
