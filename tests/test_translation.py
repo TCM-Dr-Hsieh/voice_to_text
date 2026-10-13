@@ -670,3 +670,9 @@ def test_the_error_of_the_newest_segments_and_the_error_of_the_others_do_not_hid
     assert translator.error == 'newest failed'                                         # and mending it does not mend the other
     translator._rolling_error = ''
     assert translator.error == ''
+
+
+def test_the_translator_translates_the_newest_segments_as_they_come_unless_the_meeting_settings_say_not():
+    meeting = FakeMeeting(4)
+    assert Translator(meeting, FakeLLM(), ModelConfig('m'), MeetingSettings()).rolling is True
+    assert Translator(meeting, FakeLLM(), ModelConfig('m'), MeetingSettings(live_translation=False)).rolling is False

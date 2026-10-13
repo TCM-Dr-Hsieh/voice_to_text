@@ -99,6 +99,7 @@ def test_meeting_and_translator_settings_roundtrip_and_ignore_unknown_keys(tmp_p
     ('autosave_seconds', 1, '自動存檔'), ('speaker_model_path', '  ', '聲紋模型'), ('translation_context', -1, '上下文'),
     ('background_rel_db', 0.5, '比常態小聲'), ('background_rel_db', float('nan'), '比常態小聲'), ('background_rel_db', 31, '比常態小聲'),
     ('background_max_cos', 0.05, '相似度上限'), ('background_max_cos', 0.95, '相似度上限'), ('background_filter', 'yes', '背景人聲過濾'),
+    ('live_translation', 'yes', '即時暫定翻譯'), ('live_translation', 1, '即時暫定翻譯'),
 ])
 def test_meeting_settings_are_checked(field, value, message):
     settings = Settings()
@@ -136,3 +137,29 @@ def test_the_page_listens_on_every_interface_unless_the_host_is_set(monkeypatch)
     assert listen_host() == '0.0.0.0'
     monkeypatch.setenv('VOICE_APP_HOST', ' 127.0.0.1 ')
     assert listen_host() == '127.0.0.1'
+
+
+def test_every_meeting_setting_the_dialogs_use_is_a_field_of_the_meeting_settings():
+    """The settings dialog reads and writes `draft.meeting.<name>`: a name that is not a field only shows when someone opens the dialog."""
+    import re
+    from dataclasses import fields
+    from pathlib import Path
+    from voice_app.config import MeetingSettings
+    known = {f.name for f in fields(MeetingSettings)} | {'validate'}
+    seen = {module.name: set(re.findall(r'(?:draft|settings)\.meeting\.(\w+)', module.read_text(encoding='utf-8')))
+            for module in sorted(Path(__file__).resolve().parent.parent.glob('voice_app/ui*.py'))}
+    assert len(seen['ui_settings.py']) > 10                                               # (the scan does see the dialog)
+    for name, used in seen.items():
+        assert not (used - known), (name, sorted(used - known))
+
+
+def test_the_live_translation_switch_is_on_by_default_survives_a_save_and_is_missing_from_old_files(tmp_path):
+    settings = Settings()
+    assert settings.meeting.live_translation is True
+    settings.meeting.live_translation = False
+    settings.save(tmp_path / 'settings.json')
+    assert Settings.load(tmp_path / 'settings.json').meeting.live_translation is False
+    data = json.loads((tmp_path / 'settings.json').read_text(encoding='utf-8'))
+    del data['meeting']['live_translation']                                             # a file saved before the switch existed
+    (tmp_path / 'settings.json').write_text(json.dumps(data), encoding='utf-8')
+    assert Settings.load(tmp_path / 'settings.json').meeting.live_translation is True

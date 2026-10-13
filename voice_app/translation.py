@@ -195,7 +195,7 @@ class Translator:
         self.error = ''
         self.names_error = ''                           # why the names are not translated (they keep their default names meanwhile)
         self.stats = {'calls': 0, 'failed_calls': 0, 'segments': 0, 'retranslated': 0, 'fitted': 0, 'rolling': 0, 'adopted': 0}
-        self.rolling = True                             # translate the newest segments as they come (False: only by `lag`, as before)
+        self.rolling = settings.live_translation        # translate the newest segments as they come (False: only by `lag`, as before)
         self.drafts: dict[int, Draft] = {}
         self._rolling_failures = 0
         self._rolling_error = ''                        # why the newest segments are not translated (kept apart from `error`)

@@ -75,6 +75,7 @@ class MeetingSettings:
     background_rel_db: float = 6.0       # ... when it is this many dB quieter than the usual speech level
     background_max_cos: float = 0.45     # ... and fits no voice group better than this similarity (lower = stricter)
     target_language: str = 'English'
+    live_translation: bool = True        # the newest three segments are translated as they come (a draft, one text, no speakers)
     translation_lag: int = 6             # the speaker-labelled translation runs this many segments behind the transcript (at least 3)
     translation_context: int = 50        # how many already translated segments the translator sees
     translation_batch: int = 20          # segments per call when the translation has to catch up
@@ -92,6 +93,8 @@ class MeetingSettings:
             raise ValueError('說話者人數上限須為 2–30 的整數。')
         if not isinstance(self.background_filter, bool):
             raise ValueError('背景人聲過濾須為開或關。')
+        if not isinstance(self.live_translation, bool):
+            raise ValueError('即時暫定翻譯須為開或關。')
         if not math.isfinite(self.background_rel_db) or not 1 <= self.background_rel_db <= 30:
             raise ValueError('背景人聲「比常態小聲」須介於 1–30 dB。')
         if not math.isfinite(self.background_max_cos) or not 0.1 <= self.background_max_cos <= 0.9:
