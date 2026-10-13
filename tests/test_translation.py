@@ -9,7 +9,7 @@ from voice_app.api import ModelError
 from voice_app.config import MeetingSettings, ModelConfig
 from voice_app.speaker import default_name
 from voice_app.speaker.render import Run
-from voice_app.translation import Translator, fit_runs, parse_names, parse_translation
+from voice_app.translation import ROLLING_SEGMENTS, Translator, fit_runs, parse_names, parse_rolling, parse_translation
 
 
 class FakeSpeaker:
@@ -55,6 +55,8 @@ class FakeLLM:
         self.calls = []
         self.mode = 'good'
         self.fail = 0
+        self.rolling_fail = 0                                    # how many of the next rolling (newest three segments) calls fail
+        self.rolling_reply = None                                # a function (payload) -> {i: text} to say something else than "D-N"
 
     async def __call__(self, model, *, system, user, max_tokens, validator, retries, retry_note):
         payload = json.loads(user)
@@ -62,6 +64,14 @@ class FakeLLM:
         if self.fail:
             self.fail -= 1
             raise ModelError('server down')
+        if '三段滾動' in system:                                  # the newest three segments: answers a draft "D-N" for the text "原文N"
+            if self.rolling_fail:
+                self.rolling_fail -= 1
+                raise ModelError('server down')
+            said = self.rolling_reply(payload) if self.rolling_reply else {
+                item['i']: item['source'].replace('原文', 'D-') for item in payload['translate']}
+            reply = {'segments': [{'i': i, 'text': text} for i, text in said.items()]}
+            return validator(json.dumps(reply, ensure_ascii=False))
         if 'names' in payload:                                   # the names call
             reply = {'names': {k: f'EN-{v}' for k, v in payload['names'].items()}, 'voice': 'Voice', 'unknown': 'Unknown'}
             return validator(json.dumps(reply, ensure_ascii=False))
@@ -74,7 +84,8 @@ class FakeLLM:
         return validator(json.dumps({'segments': segments}, ensure_ascii=False))
 
 
-def make(count=12, *, lag=3, batch=5, context=4, names=None):
+def make(count=12, *, lag=3, batch=5, context=4, names=None, rolling=False):
+    """The translator of a fake meeting. `rolling=False`: only the translation that follows the speaker runs, `lag` segments behind."""
     meeting = FakeMeeting(count, names)
     llm = FakeLLM()
     settings = MeetingSettings(translation_lag=lag, translation_batch=batch, translation_context=context)
@@ -82,6 +93,7 @@ def make(count=12, *, lag=3, batch=5, context=4, names=None):
     translator = Translator(meeting, llm, ModelConfig('m'), settings, on_change=lambda c: changes.append(set(c)))
     translator.language, translator.lag = 'English', lag
     translator.running = True
+    translator.rolling = rolling
     return meeting, llm, translator, changes
 
 
@@ -403,3 +415,258 @@ async def test_new_input_never_inherits_old_failures_whether_or_not_anyone_annou
     meeting.ended = True
     await drain(translator, 80)
     assert translator.results[3].texts and not translator.results[3].error and not translator.failed()
+
+
+
+# ---------------------------------------------------------------------- the newest segments, translated as they come
+
+def rolling_calls(llm):
+    return [c['user'] for c in llm.calls if '三段滾動' in c['system']]
+
+
+def run_calls(llm):
+    """The calls that translate by speaker runs (the finished translation)."""
+    return [c['user'] for c in llm.calls if 'translate' in c['user'] and c['user']['translate'] and 'runs' in c['user']['translate'][0]]
+
+
+def segments_of(calls):
+    return [item['i'] for call in calls for item in call['translate']]
+
+
+def add_segment(meeting, text=None):
+    i = len(meeting.segments) + 1
+    meeting.segments.append(SimpleNamespace(index=i, runs=[Run(i % 2, 'voice', text or f'原文{i}')]))
+
+
+def test_the_rolling_translation_is_as_long_as_the_proofreader_revises_and_the_least_lag():
+    from voice_app.config import MIN_TRANSLATION_LAG
+    from voice_app.meeting import REVISABLE
+    assert ROLLING_SEGMENTS == REVISABLE == MIN_TRANSLATION_LAG == 3
+
+
+def test_the_rolling_reply_is_read_and_must_have_a_translation_for_every_segment():
+    assert parse_rolling('{"segments":[{"i":8,"text":" a "},{"i":9,"text":"b"}]}', [8, 9]) == {8: 'a', 9: 'b'}
+    assert parse_rolling('```json\n{"segments":[{"i":9,"text":"b",},],}\n```', [9]) == {9: 'b'}
+    for reply, message in [('{"segments":[{"i":8,"text":"a"}]}', '缺少'), ('{"segments":[{"i":8,"text":"a"},{"i":9,"text":" "}]}', '空的'),
+                           ('{"segments":[{"i":8}]}', '無效'), ('here you go', '無效')]:
+        with pytest.raises(ModelError, match=message):
+            parse_rolling(reply, [8, 9])
+
+
+@pytest.mark.asyncio
+async def test_the_newest_three_segments_are_translated_at_once_while_the_finished_translation_waits_for_the_lag():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    await drain(translator)
+    first = rolling_calls(llm)[0]
+    assert [item['i'] for item in first['translate']] == [8, 9, 10] and all(item['current'] == '' for item in first['translate'])
+    assert first['translate'][0]['source'] == '原文8' and first['glossary'] == ''
+    assert [translator.draft_text(i) for i in (8, 9, 10)] == ['D-8', 'D-9', 'D-10']
+    assert sorted(translator.results) == [1, 2, 3, 4]                                  # the finished ones: 10 - lag
+    assert [translator.tr_state(i) for i in (2, 6, 9)] == ['ok', '', 'draft']          # segment 6 has neither yet
+    assert translator.stats['rolling'] == 1
+
+
+@pytest.mark.asyncio
+async def test_every_new_segment_translates_the_last_three_again_with_the_drafts_they_have():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    await drain(translator)
+    add_segment(meeting)
+    await drain(translator)
+    second = rolling_calls(llm)[1]
+    assert [(item['i'], item['current']) for item in second['translate']] == [(9, 'D-9'), (10, 'D-10'), (11, '')]
+    llm.rolling_reply = lambda payload: {item['i']: (item['current'] + '+' if item['current'] else item['source'].replace('原文', 'D-'))
+                                         for item in payload['translate']}
+    add_segment(meeting)
+    await drain(translator)
+    assert [translator.draft_text(i) for i in (10, 11, 12)] == ['D-10+', 'D-11+', 'D-12']      # the model mended the older two
+    assert translator.draft_text(9) == 'D-9'                                                    # (9 is out of the window: it stays)
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_given_the_finished_translations_the_newest_five_with_their_source_and_the_rest_without():
+    meeting, llm, translator, _ = make(count=14, lag=3, context=10, rolling=True)
+    await drain(translator)
+    for _ in range(2):
+        add_segment(meeting)
+        await drain(translator)
+    call = rolling_calls(llm)[-1]
+    first = call['translate'][0]['i']
+    context = call['already_translated']
+    assert [item['i'] for item in context] == list(range(max(1, first - 10), first))
+    for item in context:
+        assert ('source' in item) == (first - item['i'] <= 5), item['i']
+        if 'source' in item:
+            assert item['translation'] in (item['source'].replace('原文', 'T-'), item['source'].replace('原文', 'D-'))
+
+
+@pytest.mark.asyncio
+async def test_a_segment_with_one_speaker_whose_draft_was_made_from_its_text_needs_no_second_translation():
+    meeting, llm, translator, changes = make(count=5, lag=3, rolling=True)
+    await drain(translator)
+    for _ in range(3):
+        add_segment(meeting)
+        await drain(translator)
+    asked = segments_of(run_calls(llm))
+    assert translator.results[3].texts == ['D-3'] and translator.results[3].sources == ('原文3',) and translator.tr_state(3) == 'ok'
+    assert 3 not in asked and 4 not in asked and translator.stats['adopted'] >= 2
+    assert translator.results[3].gids == (1,)                                        # segment 3 was spoken by speaker 1 (odd)
+    assert any(3 in change for change in changes)                                    # the screen was told
+
+
+@pytest.mark.asyncio
+async def test_a_segment_with_several_speakers_is_translated_by_runs():
+    meeting, llm, translator, _ = make(count=5, lag=3, rolling=True)
+    await drain(translator)
+    meeting.segments[2].runs = [Run(0, 'voice', '甲'), Run(1, 'voice', '乙')]            # the speakers of segment 3 turned out to be two
+    add_segment(meeting)
+    await drain(translator)
+    assert 3 in segments_of(run_calls(llm)) and translator.results[3].texts == ['甲', '乙']
+
+
+@pytest.mark.asyncio
+async def test_a_segment_whose_text_changed_since_its_draft_is_translated_by_runs():
+    meeting, llm, translator, _ = make(count=5, lag=3, rolling=True)
+    await drain(translator)
+    meeting.segments[2].runs = [Run(1, 'voice', '原文3改')]                              # (the draft was made from 原文3)
+    add_segment(meeting)
+    await drain(translator)
+    assert 3 in segments_of(run_calls(llm)) and translator.results[3].texts == ['T-3改']
+
+
+@pytest.mark.asyncio
+async def test_a_failing_rolling_translation_waits_and_never_holds_the_finished_translation_back():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    llm.rolling_fail = 2
+    await drain(translator)
+    assert translator.drafts == {} and translator.error.startswith('翻譯失敗') and sorted(translator.results) == [1, 2, 3, 4]
+    assert not translator._rolling_due()                                              # it waits (2 s after the first failure), no hot loop
+    assert translator._rolling_retry_after > 0 and translator.stats['failed_calls'] == 1
+    translator._rolling_retry_after = 0.0
+    await drain(translator)                                                           # the second failure
+    assert translator._rolling_failures == 2 and not translator._rolling_due() and translator.error.startswith('翻譯失敗')
+    translator._rolling_retry_after = 0.0
+    await drain(translator)
+    assert [translator.draft_text(i) for i in (8, 9, 10)] == ['D-8', 'D-9', 'D-10'] and translator.error == ''
+    assert translator._rolling_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_the_rolling_and_the_finished_translation_take_turns_while_one_is_behind():
+    meeting, llm, translator, _ = make(count=20, lag=3, batch=2, rolling=True)
+    await translator._step()                                                          # (the names)
+    kinds = []
+    for _ in range(6):
+        before = len(llm.calls)
+        await translator._step()
+        kinds += ['R' if '三段滾動' in c['system'] else 'B' for c in llm.calls[before:]]
+        add_segment(meeting)
+    assert kinds == ['R', 'B', 'R', 'B', 'R', 'B']
+
+
+@pytest.mark.asyncio
+async def test_background_talk_is_never_shown_translated_as_a_draft_either():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    await drain(translator)
+    assert translator.draft_text(9) == 'D-9'
+    meeting.segments[8].runs = [Run(None, 'background', '原文9')]                       # the user marks segment 9 as background talk
+    assert translator.draft_text(9) is None and translator.tr_state(9) == ''
+    add_segment(meeting)
+    await drain(translator)
+    assert [item['i'] for item in rolling_calls(llm)[-1]['translate']] == [10, 11]    # its text is not translated
+    assert translator.draft_text(9) is None
+    meeting.segments[9].runs = [Run(None, 'background', '原文10甲'), Run(0, 'voice', '原文10乙')]       # part of segment 10 is
+    await drain(translator)
+    items = {item['i']: item for item in rolling_calls(llm)[-1]['translate']}
+    assert items[10] == {'i': 10, 'source': '原文10乙', 'current': ''}                  # the old draft held the background text: not shown
+    assert translator.draft_text(10) == 'D-10乙'
+
+
+@pytest.mark.asyncio
+async def test_once_the_meeting_has_ended_the_rest_is_finished_by_runs_or_from_the_drafts_and_nothing_new_is_rolled():
+    meeting, llm, translator, _ = make(count=8, lag=6, rolling=True)
+    await drain(translator)
+    rolled = len(rolling_calls(llm))
+    meeting.ended = True
+    meeting.segments[6].runs = [Run(0, 'voice', '甲'), Run(1, 'voice', '乙')]
+    await drain(translator)
+    assert len(rolling_calls(llm)) == rolled and sorted(translator.results) == list(range(1, 9))
+    asked = segments_of(run_calls(llm))
+    assert 7 in asked and 6 not in asked and 8 not in asked                           # 7 has two speakers; 6 and 8 take their drafts
+    assert translator.results[6].texts == ['D-6'] and translator.status == '翻譯完成'
+
+
+@pytest.mark.asyncio
+async def test_a_new_language_starts_without_the_old_drafts_and_the_file_marks_what_is_only_a_draft():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    await drain(translator)
+    doc = translator.doc()['segments']
+    assert doc['2'] == {'texts': ['T-2'], 'error': ''} and doc['9'] == {'texts': ['D-9'], 'error': '', 'draft': True}
+    translator.start('Japanese', 6)
+    await translator.stop()
+    translator.running = True
+    assert translator.drafts == {} and translator.results == {}
+    await drain(translator)
+    assert translator.draft_text(10) == 'D-10'
+
+
+@pytest.mark.asyncio
+async def test_a_segment_whose_finished_translation_failed_still_shows_its_draft_and_stays_listed_as_failed():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    await drain(translator)
+    translator.results[9] = translation.Translated(9, ('原文9',), [], (), error='server down')
+    assert translator.tr_state(9) == 'draft' and translator.failed() == [9]
+    assert translator.doc()['segments']['9'] == {'texts': ['D-9'], 'error': 'server down', 'draft': True}
+    translator.results[2] = translation.Translated(2, ('原文2',), [], (), error='server down')
+    assert translator.tr_state(2) == 'error'                                          # nothing else to show for it
+
+
+@pytest.mark.asyncio
+async def test_the_old_way_is_still_there_when_the_rolling_translation_is_off():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=False)
+    await drain(translator)
+    assert rolling_calls(llm) == [] and translator.drafts == {} and sorted(translator.results) == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_the_failure_of_the_newest_segments_ends_with_the_meeting():
+    meeting, llm, translator, _ = make(count=8, lag=3, rolling=True)
+    llm.rolling_fail = 1
+    await drain(translator)
+    assert translator._rolling_failures == 1 and translator.error.startswith('翻譯失敗')
+    meeting.ended = True                                                              # nothing is rolled any more
+    await drain(translator)
+    assert translator._rolling_failures == 0 and translator.error == '' and translator.status == '翻譯完成'
+
+
+@pytest.mark.asyncio
+async def test_the_failure_of_the_newest_segments_ends_when_they_turn_out_to_be_background_talk():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    llm.rolling_fail = 1
+    await drain(translator)
+    assert translator._rolling_failures == 1 and translator.error.startswith('翻譯失敗')
+    for i in (8, 9, 10):
+        meeting.segments[i - 1].runs = [Run(None, 'background', f'原文{i}')]            # there is nothing left to translate there
+    await drain(translator)
+    assert translator._rolling_failures == 0 and translator.error == '' and not translator._rolling_due()
+
+
+@pytest.mark.asyncio
+async def test_the_failure_of_the_newest_segments_ends_when_the_rolling_translation_is_switched_off():
+    meeting, llm, translator, _ = make(count=10, lag=6, rolling=True)
+    llm.rolling_fail = 1
+    await drain(translator)
+    translator.rolling = False
+    await drain(translator)
+    assert translator._rolling_failures == 0 and translator.error == ''
+
+
+def test_the_error_of_the_newest_segments_and_the_error_of_the_others_do_not_hide_each_other():
+    meeting, llm, translator, _ = make(count=4, rolling=True)
+    translator._rolling_error = 'newest failed'
+    assert translator.error == 'newest failed'
+    translator.error = 'finished failed'
+    assert translator.error == 'finished failed'                                       # the finished translation's goes first
+    translator.error = ''
+    assert translator.error == 'newest failed'                                         # and mending it does not mend the other
+    translator._rolling_error = ''
+    assert translator.error == ''

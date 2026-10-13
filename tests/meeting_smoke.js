@@ -175,4 +175,25 @@ assert.deepEqual(colours(left(0)).slice(0, 4), ['m-c0', 'm-c1', 'm-c2', 'm-c3'])
 view.update({labels: {...labels, palette: 4}, reset: true, rows: [{i: 1, rev: false, runs: [{g: 6, t: '甲。', s: 'voice'}]}]});
 assert.deepEqual(colours(left(0)), ['m-c2']);                              // 6 % 4
 
+// 12. a draft translation is one text for the segment with no speaker label (who speaks is not settled yet); the newest rows are
+//     yellow on the right too (it may still change); the finished translation, one line per speaker, replaces it
+view.update({reset: true, labels, rows: [
+  {i: 1, rev: true, runs: [{g: 0, t: '甲。', s: 'voice'}, {g: 1, t: '乙。', s: 'voice'}],
+   tr: {st: 'draft', err: '', runs: [{g: null, t: 'First and second.'}]}},
+  {i: 2, rev: false, runs: [{g: 0, t: '丙。', s: 'voice'}], tr: {st: 'draft', err: '', runs: [{g: null, t: 'Third.'}]}},
+]});
+assert.equal(right(0).textContent, 'Voice#1First and second.');                // no "Unknown:" in front of it
+assert.equal(right(0).children.length, 1);
+assert.deepEqual(colours(right(0)), ['']);                                      // and no speaker colour
+assert.equal(has(right(0), 'm-rev'), true);
+assert.equal(has(right(1), 'm-rev'), false);                                    // out of the newest rows: a draft that stays, not yellow
+assert.equal(right(1).textContent, 'Voice#2Third.');
+view.update({rows: [{i: 1, rev: false, runs: [{g: 0, t: '甲。', s: 'voice'}, {g: 1, t: '乙。', s: 'voice'}],
+                     tr: {st: 'ok', err: '', runs: [{g: 0, t: 'First.'}, {g: 1, t: 'Second.'}]}}]});
+assert.equal(right(0).textContent, 'Voice#1Host Wang: First.Speaker-002: Second.');
+assert.equal(has(right(0), 'm-rev'), false);
+view.update({labels: {...labels, marking: false}});                              // without marking a draft is still just the text
+assert.equal(right(1).textContent, 'Voice#2Third.');
+view.update({labels});
+
 console.log('meeting view smoke test passed');

@@ -75,7 +75,7 @@ class MeetingSettings:
     background_rel_db: float = 6.0       # ... when it is this many dB quieter than the usual speech level
     background_max_cos: float = 0.45     # ... and fits no voice group better than this similarity (lower = stricter)
     target_language: str = 'English'
-    translation_lag: int = 6             # the translation runs this many segments behind the transcript (at least 3)
+    translation_lag: int = 6             # the speaker-labelled translation runs this many segments behind the transcript (at least 3)
     translation_context: int = 50        # how many already translated segments the translator sees
     translation_batch: int = 20          # segments per call when the translation has to catch up
     autosave_seconds: float = 20.0

@@ -111,7 +111,12 @@ class MeetingView {
     });
     const tr = data.tr;
     right.classList.toggle('m-stale', !!tr && tr.st === 'stale');
+    right.classList.toggle('m-rev', !!tr && tr.st === 'draft' && !!data.rev);       // a draft of the newest rows: it may still change
     if (!tr) return;
+    if (tr.st === 'draft') {                       // one text for the segment, no speakers (they are not settled yet)
+      right.append(this.line(`${this.labels.tvoice}#${data.i}`, '', '', tr.runs.map(run => run.t).join(' '), ''));
+      return;
+    }
     if (tr.st === 'error') {
       right.append(this.line(`${this.labels.tvoice}#${data.i}`, '', '', `（翻譯失敗）${tr.err || ''}`, 'm-error'));
       return;

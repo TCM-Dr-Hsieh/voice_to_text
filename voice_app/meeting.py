@@ -220,11 +220,14 @@ class Meeting:
         runs = self.speaker.runs(segment)
         row = {'i': index, 'rev': revisable, 'runs': [{'g': r.gid, 't': r.text, 's': r.source} for r in runs]}
         result = self.translator.visible(index)
-        if result is not None:
+        draft = self.translator.draft_text(index)
+        if result is not None and not (result.error and draft):
             gids = self._translation_gids(segment, result)
             state = self.translator.tr_state(index)
             row['tr'] = {'st': state, 'runs': [{'g': g, 't': t} for g, t in zip(gids, result.texts)],
                          'err': result.error[:120] if result.error else ''}
+        elif draft:                                   # not finished (or its finishing failed): the draft, one text with no speakers
+            row['tr'] = {'st': 'draft', 'runs': [{'g': None, 't': draft}], 'err': ''}
         return row
 
     def drain(self) -> dict | None:
@@ -304,7 +307,7 @@ class Meeting:
         who = [f'{default_name(s["gid"])} = {s["label"]}' if s['name'] else s['default'] for s in speaker.speakers()]
         if who:
             lines.append('說話者：' + '、'.join(who))
-        if translator.results:
+        if translator.results or any(d.text for d in translator.drafts.values()):
             names = '、'.join(f'{translator.label_for(s["gid"])}' for s in speaker.speakers() if s['name'])
             lines.append(f'翻譯語言：{translator.language}' + (f'（{names}）' if names else ''))
         lines.append('')
@@ -317,10 +320,13 @@ class Meeting:
                 who = '[背景]' if run.background else f'{speaker.name_of(run.gid)}{"*" if run.source in ("text", "text2") else ""}'
                 lines.append(f'{prefix}{who}: {run.text}')
             result = translator.visible(segment.index)
+            draft = translator.draft_text(segment.index)
             if result is not None and result.texts and not result.error:
                 gids = self._translation_gids(segment, result)
                 for k, (gid, text) in enumerate(zip(gids, result.texts)):
                     prefix = f'{translator.names.voice}#{segment.index} ' if k == 0 else ' ' * (len(f'{translator.names.voice}#{segment.index}') + 1)
                     lines.append(f'{prefix}{translator.label_for(gid)}: {text}')
+            elif draft:                               # not finished yet: the draft has no speakers
+                lines.append(f'{translator.names.voice}#{segment.index} {draft}')
             lines.append('')
         return '\n'.join(lines).rstrip('\n') + '\n'

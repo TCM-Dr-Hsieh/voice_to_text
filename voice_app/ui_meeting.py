@@ -22,7 +22,9 @@ def build_meeting_panel(state, on_start_translation, on_stop_translation, on_spe
                 language = ui.input('語言', value=settings.target_language).props('dense outlined').classes('w-40')
                 lag = ui.number('延遲語音數', value=settings.translation_lag, min=MIN_TRANSLATION_LAG, max=60, step=1,
                                 format='%d').props('dense outlined').classes('w-32').tooltip(
-                    f'翻譯會比逐字稿慢這麼多段（最小 {MIN_TRANSLATION_LAG}）：延遲越多，翻譯越能參考後文')
+                    f'最新幾段先顯示不分說話者的暫定譯文（黃色底）；後面累積到這個段數後，才換成標示說話者的正式譯文（最小 {MIN_TRANSLATION_LAG}）。'
+                    '這個數字主要決定說話者名字何時出現。已有同原文暫定譯文的單一說話者段落直接轉正；'
+                    '多位說話者、或沒有可採用暫定譯文的段落，才會重新翻譯，並在待翻段落之外另外附上後續至多這麼多段可用的原文')
                 start_button = ui.button('開始翻譯', icon='translate', on_click=on_start_translation)
                 stop_button = ui.button('停止翻譯', icon='stop_circle', on_click=on_stop_translation).props('outline')
                 retry_button = ui.button('重試失敗段落', icon='refresh', on_click=on_retry_translation).props('outline color=amber-9')

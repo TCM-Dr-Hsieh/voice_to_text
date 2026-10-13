@@ -9,7 +9,7 @@ from voice_app.audio import Chunk, RATE
 from voice_app.config import Settings
 from voice_app.meeting import Meeting, reserve_meeting_path
 from voice_app.session import Session
-from voice_app.translation import Translated
+from voice_app.translation import Draft, Translated
 from tests.speaker_fakes import FakeEmbedder, bases, build, make_turns, window_of
 
 
@@ -153,6 +153,32 @@ async def test_the_bilingual_text_puts_each_translation_under_its_segment_with_t
         assert any(line.startswith('Voice#1 ') for line in lines[first:first + 4])
         assert 'Mr. Wang' in text or gids[0] not in [r.gid for r in runs]
         assert 'Voice#2 ' not in text                                        # untranslated segments have only the source line
+    finally:
+        await meeting.close()
+
+
+@pytest.mark.asyncio
+async def test_a_draft_translation_goes_to_the_page_as_one_text_and_into_the_bilingual_text_until_the_finished_one_replaces_it(tmp_path):
+    meeting, session, play, _ = fake_meeting(tmp_path, [0, 1] * 14)
+    try:
+        await play(0, 12)
+        index = len(session.segments)
+        runs = meeting.speaker.translation_runs(session.segments[index - 1])
+        translator = meeting.translator
+        translator.language = 'English'
+        translator.drafts[index] = Draft('Hello there', tuple(r.text for r in runs))
+        meeting.drain()
+        meeting._mark({index})
+        row = next(r for r in meeting.drain()['rows'] if r['i'] == index)
+        assert row['tr'] == {'st': 'draft', 'runs': [{'g': None, 't': 'Hello there'}], 'err': ''}
+        text = meeting.export_text()
+        assert f'Voice#{index} Hello there' in text and '翻譯語言：English' in text
+        assert translator.doc()['segments'][str(index)] == {'texts': ['Hello there'], 'error': '', 'draft': True}
+        translator.results[index] = Translated(index, tuple(r.text for r in runs), [f'T{k}' for k in range(len(runs))], tuple(r.gid for r in runs))
+        meeting._mark({index})
+        row = next(r for r in meeting.drain()['rows'] if r['i'] == index)
+        assert row['tr']['st'] == 'ok' and row['tr']['runs'][0]['t'] == 'T0'
+        assert 'Hello there' not in meeting.export_text()
     finally:
         await meeting.close()
 
