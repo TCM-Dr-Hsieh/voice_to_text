@@ -12,7 +12,8 @@ import json
 from pathlib import Path
 
 MANIFEST_PATH = Path(__file__).with_name('model_manifest.json')
-REPOS = {'asr': 'Qwen/Qwen3-ASR-1.7B', 'aligner': 'Qwen/Qwen3-ForcedAligner-0.6B'}
+REPOS = {'asr': 'Qwen/Qwen3-ASR-1.7B', 'aligner': 'Qwen/Qwen3-ForcedAligner-0.6B',
+         'speaker': 'csukuangfj/speaker-embedding-models'}
 
 
 def load_manifest(path: Path = MANIFEST_PATH) -> dict:

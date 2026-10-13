@@ -23,7 +23,7 @@ async def main():
     session = Session()
     try:
         print(await local_asr.load(settings), flush=True)
-        session.start(settings, 'file', path=args.audio)
+        await session.start(settings, 'file', path=args.audio)
         await session.task
         print(session.export_json(), flush=True)
         if session.error:

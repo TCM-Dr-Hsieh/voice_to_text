@@ -109,12 +109,23 @@ class AudioSource:
         self.stop = threading.Event()
         self.cancelled = threading.Event()
         self.done = threading.Event()
+        self.opened = threading.Event()               # the first block of audio was read: the device or the file really opened
         self.error = ''
         self.level = 0.0
         self.thread = threading.Thread(target=self._produce, daemon=True)
 
     def start(self):
         self.thread.start()
+
+    async def wait_open(self):
+        """`start()` only starts the producer thread: the device is opened and the file decoded in it, and a failure there ends the
+        thread with the reason in `error`. Wait until audio is really coming in (or the source ended without failing, like an empty
+        file, or was cancelled) and raise that reason otherwise, so a start that cannot work is a failed start, not an empty run.
+        A slow source is waited for as long as it takes: only the caller's `cancel()` ends the wait."""
+        while not (self.opened.is_set() or self.done.is_set() or self.cancelled.is_set()):
+            await asyncio.sleep(0.02)
+        if self.done.is_set() and not self.opened.is_set() and self.error:
+            raise RuntimeError(self.error)
 
     def _put(self, chunk):
         if self.emergency:
@@ -146,6 +157,7 @@ class AudioSource:
                             record_device(self.kind, self.device_id, self.stop))
                 try:
                     for samples in iterator:
+                        self.opened.set()
                         if self.cancelled.is_set() or (self.kind == 'file' and self.stop.is_set()):
                             break
                         if recording is not None:

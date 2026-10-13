@@ -1,6 +1,7 @@
 """One-page voice writing UI. The article stays in the browser."""
 
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
@@ -14,10 +15,15 @@ from nicegui import app, ui
 from .api import ModelAPI
 from .asr import local_asr
 from .audio import devices
-from .config import ROOT, Settings, shared_mode, source_allowed
+from .config import ROOT, Settings, resolve_path, shared_mode, source_allowed
+from .meeting import Meeting
 from .remote_audio import REMOTE_PAGES, RemoteAudioSource
-from .session import Session
+from .session import Session, StartCancelled
+from .speaker.palette import palette_css
+from .speaker.embedder import load_embedder
 from .ui_controls import build_source_controls
+from .ui_settings import show_settings_dialog
+from .ui_meeting import (build_meeting_panel, export_filename, open_speakers_dialog, read_translation_inputs)
 from .ui_render import revisable_split
 
 
@@ -28,14 +34,95 @@ app.add_static_file(local_file=ROOT / 'voice_app' / 'script_converter.js',
                     url_path='/script_converter.js', max_cache_age=0)
 app.add_static_file(local_file=ROOT / 'voice_app' / 'writing.js',
                     url_path='/writing.js', max_cache_age=0)
+app.add_static_file(local_file=ROOT / 'voice_app' / 'meeting.js',
+                    url_path='/meeting.js', max_cache_age=0)
 ui.add_head_html('<script src="/opencc.full.js?v=1.4.2"></script>'
                  '<script src="/script_converter.js?v=3"></script>'
-                 '<script src="/writing.js?v=7"></script>', shared=True)
+                 '<script src="/writing.js?v=7"></script>'
+                 '<script src="/meeting.js?v=1"></script>', shared=True)
 
 
 def writing_commit_ready(session: Session) -> bool:
-    return bool(not session.active and not session.processing and session.source
+    return bool(not session.starting and not session.active and not session.processing and session.source
                 and session.source.done.is_set() and not session.error)
+
+
+def writing_in_play(state, session: Session) -> bool:
+    """Whether the article is waiting for the text of the run in `session`. Not while that run is only being started (the models load,
+    the audio opens): `session` is then still the last run, a finished one, and its text must neither be shown nor inserted again.
+    (`state.loading` says nothing of this: a remote recording holds it for as long as it runs.)"""
+    return bool(state.writing_pending and not state.writing_starting and not session.starting)
+
+
+def cancel_start(state, session: Session) -> bool:
+    """The user cancels a run that this page is still preparing (the models load, a meeting is made): when the preparation is done it
+    opens no audio. False when the run is further along (the audio is opening, or it records): `Session.cancel()` ends that one."""
+    if state.writing_starting and not session.starting:
+        state.start_cancelled = True
+        session.status = '已取消；模型載入完成後不會開始錄音'
+        return True
+    return False
+
+
+async def cancel_run(state, session: Session) -> None:
+    """The user cancels: a run still loading its models opens no audio (`cancel_start`), the article is given back, and the session stops
+    its source. The session is cancelled at once and alongside: a browser that does not answer (it is gone, or slow) must not be able to
+    keep the audio running; a failure to give the article back is still reported, after the session has been cancelled."""
+    cancel_start(state, session)
+    cancelling = asyncio.ensure_future(session.cancel())
+    try:
+        if state.writing_pending:
+            state.writing_pending = False
+            state.last_writing_render = None
+            await ui.run_javascript('window.writing.rollback()')
+    finally:
+        await cancelling
+
+
+async def launch_run(state, session: Session, kind: str, writing_context) -> None:
+    """Load the models, make the meeting of a meeting-mode run, and start the session. Whatever goes wrong or is cancelled on the way
+    is told on the page and leaves the last run as it was."""
+    controls = state.controls
+    state.loading = state.writing_starting = True
+    state.start_cancelled = False
+    meeting = None
+    try:
+        state.settings.validate()
+        session.status = '載入本機 ASR 與 ForcedAligner，準備辨識'
+        async with ModelAPI(state.settings) as api:
+            await api.prepare_asr()
+        if state.start_cancelled:
+            raise StartCancelled('已取消，音訊來源未啟動。')
+        if state.disconnected:
+            session.status = '頁面已離線，未啟動音訊'
+            if not state.meeting_mode:
+                state.writing_pending = False
+                await ui.run_javascript('window.writing.rollback()')
+            return
+        path = state.uploaded_path if kind == 'file' else None
+        meeting = await state.prepare_meeting() if state.meeting_mode else None
+        if state.start_cancelled:
+            raise StartCancelled('已取消，音訊來源未啟動。')
+        await session.start(state.settings, kind, controls.device.value, path,
+                            record_audio=bool(controls.record_switch.value) and kind != 'file',
+                            writing_context=writing_context, meeting=meeting)
+        if path:
+            session.owned_file = path
+            state.uploaded_path = None
+            controls.file_label.set_text('音訊檔已交由背景處理')
+    except Exception as exc:
+        if meeting is not None and session.meeting is not meeting:
+            await meeting.discard()                # the audio never opened: no empty meeting is left behind
+        if isinstance(exc, StartCancelled):        # the user cancelled: nothing went wrong
+            session.status = '已取消，音訊來源未啟動'
+        else:
+            session.error = f'無法開始：{exc}'
+            session.status = '請檢查模型與音訊來源'
+        if not state.meeting_mode and state.writing_pending:       # (a cancel has already taken the article back)
+            state.writing_pending = False
+            await ui.run_javascript('window.writing.rollback()')
+    finally:
+        state.loading = state.writing_starting = state.start_cancelled = False
 
 
 def writing_source_allowed(kind: str) -> bool:
@@ -50,7 +137,10 @@ class PageState:
     settings_error: str = ''
     uploaded_path: Path | None = None
     loading: bool = False
+    writing_starting: bool = False     # this page is starting a run (models, audio): `session` still holds the last run until it has begun
+    start_cancelled: bool = False      # the user cancelled that run while its models were still loading: it must not open the audio
     remote_start_id: str = ''
+    remote_attempt: object = None      # the remote start that is waiting for the models and for the browser's confirmation
     disconnected: bool = False
     remote_token: str = ''
     controls: SimpleNamespace | None = None
@@ -59,6 +149,9 @@ class PageState:
     writing_history: list[dict] = field(default_factory=list)
     last_writing_render: tuple | None = None
     script_mode: str = 'original'
+    meeting_mode: bool = False
+    prepare_meeting: object = None
+    meeting_widgets: SimpleNamespace | None = None
 
 
 CSS = '''
@@ -79,11 +172,29 @@ body {background:#f3f5f7;color:#203044;font-family:"Segoe UI","Microsoft JhengHe
 .writing-revisable {background:#fff1c8;}
 .writing-confirm {border:1px solid #bdcbd8;border-radius:12px;padding:24px;}
 .writing-confirm button {margin-right:8px;}
+.m-head {display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:center;width:100%;}
+.m-scroll {width:100%;height:62vh;overflow:auto;border:1px solid #cad5df;border-radius:10px;background:white;font:16px/1.7 "Segoe UI","Microsoft JhengHei",sans-serif;}
+.m-row {display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid #eef2f6;}
+.m-left,.m-right {padding:6px 14px;overflow-wrap:anywhere;min-width:0;}
+.m-right {border-left:1px solid #eef2f6;background:#fbfcfd;}
+.m-line {border-left:3px solid transparent;padding-left:6px;}
+.m-n {color:#8a9bb0;font-size:12px;margin-right:8px;}
+.m-who {font-weight:600;color:#285f91;}
+.m-unknown .m-who {color:#8a9bb0;font-weight:400;}
+.m-bg {color:#8a9bb0;}
+.m-bg .m-who {color:#8a9bb0;font-weight:400;}
+.m-act .m-who, .m-who.m-act {cursor:pointer;text-decoration:underline dotted;}
+.m-rev {background:#fff1c8;}
+.m-stale {opacity:.65;}
+.m-error {color:#b3261e;}
+#meeting-host:empty {min-height:40vh;border:1px dashed #cad5df;border-radius:10px;display:flex;align-items:center;justify-content:center;}
+#meeting-host:empty::before {content:'按「開始轉錄」後，語音（標示說話者）與翻譯會顯示在這裡。';color:#738295;padding:16px;text-align:center;}
+@media (max-width:900px) {.m-head,.m-row {grid-template-columns:1fr;} .m-right {border-left:none;border-top:1px dashed #eef2f6;}}
 '''
 
 
 def build_page():
-    ui.add_css(CSS)
+    ui.add_css(CSS + palette_css())
     ui.colors(primary='#285f91', secondary='#5f7c96', accent='#c58d23',
               positive='#2e7d64')
     session = Session()
@@ -101,30 +212,47 @@ def build_page():
     async def cleanup():
         REMOTE_PAGES.pop(state.remote_token, None)
         await session.cancel()
+        if session.meeting is not None:
+            await session.meeting.close()
         if state.uploaded_path:
             state.uploaded_path.unlink(missing_ok=True)
         SESSIONS.discard(session)
 
     def on_disconnect():
         state.disconnected = True
-        if not isinstance(session.source, RemoteAudioSource):
-            session.request_stop()
+        if not isinstance(session.source, RemoteAudioSource) and session.meeting is None:
+            session.request_stop()          # a meeting goes on while the page reconnects; its file is saved as it runs
 
     def on_connect():
         state.disconnected = False
 
+    def mark_background(event):
+        """A click on a speaker label in the transcript: "this is background talk" / "this is not"."""
+        meeting = session.meeting
+        args = event.args[0] if isinstance(event.args, (list, tuple)) and event.args else event.args
+        if meeting is None or not isinstance(args, dict):
+            return
+        try:
+            meeting.speaker.set_background(int(args['i']), int(args['r']), str(args['t']), bool(args['to']))
+        except (ValueError, KeyError, TypeError) as exc:
+            ui.notify(str(exc) or '無法標記這一句。', type='warning')
+
+    ui.on('meeting_background', mark_background)
     client.on_disconnect(on_disconnect)
     client.on_connect(on_connect)
     client.on_delete(cleanup)
 
     async def cancel_current():
-        if state.writing_pending:
-            state.writing_pending = False
-            state.last_writing_render = None
-            await ui.run_javascript('window.writing.rollback()')
-        await session.cancel()
+        await cancel_run(state, session)
 
     async def change_script(mode: str):
+        if state.meeting_mode:
+            mode = 'original' if state.script_mode == mode else mode
+            await ui.run_javascript(f'window.scriptConverter.setMode({json.dumps(mode)}); window.meeting.setScript({json.dumps(mode)})')
+            state.script_mode = mode
+            controls.simplified_button.set_text('✓ 轉簡體' if mode == 'simplified' else '轉簡體')
+            controls.traditional_button.set_text('✓ 轉繁體' if mode == 'traditional' else '轉繁體')
+            return
         if state.writing_pending:
             ui.notify('請先完成或取消目前語音，再轉換文章字形。', type='warning')
             return
@@ -145,6 +273,79 @@ def build_page():
         except Exception as exc:
             ui.notify(f'繁簡轉換失敗：{exc}', type='negative')
 
+    async def prepare_meeting() -> Meeting:
+        """A new meeting for the session about to start. Without the voiceprint model the meeting still runs, without speakers."""
+        settings = deepcopy(state.settings)
+        note = ''
+        try:
+            embed = await asyncio.to_thread(load_embedder, resolve_path(settings.meeting.speaker_model_path))
+        except Exception as exc:
+            embed, note = (lambda samples: None), str(exc)
+        meeting = Meeting(settings, embed)
+        if note:
+            meeting.speaker.unavailable = note
+            meeting.emit('speaker_unavailable', reason=note)
+        return meeting
+
+    state.prepare_meeting = prepare_meeting
+
+    async def apply_meeting_mode():
+        widgets = state.meeting_widgets
+        article_card.set_visibility(not state.meeting_mode)
+        widgets.card.set_visibility(state.meeting_mode)
+        controls.meeting_button.set_text('✓ 會議模式' if state.meeting_mode else '會議模式')
+        if state.meeting_mode:
+            controls.record_switch.set_value(True)
+            await ui.run_javascript('window.writing.setMode(false)')
+        else:
+            await ui.run_javascript(f'window.writing.setMode(true, {state.settings.context_chars})')
+
+    async def toggle_meeting():
+        if session.active or state.loading or state.writing_pending:
+            ui.notify('請先完成或取消目前的轉錄，再切換會議模式。', type='warning')
+            return
+        state.meeting_mode = not state.meeting_mode
+        await apply_meeting_mode()
+
+    async def start_translation():
+        meeting = session.meeting
+        if meeting is None:
+            ui.notify('請先按「開始轉錄」；會議開始後才能翻譯。', type='warning')
+            return
+        try:
+            language, lag = read_translation_inputs(state.meeting_widgets)
+            meeting.translator.start(language, lag)
+        except ValueError as exc:
+            ui.notify(str(exc), type='warning')
+            return
+        state.settings.meeting.target_language, state.settings.meeting.translation_lag = language, lag
+        try:
+            state.settings.save()                  # remembered for the next meeting
+        except Exception as exc:
+            ui.notify(f'翻譯已開始，但設定無法儲存：{exc}', type='warning')
+
+    async def stop_translation():
+        if session.meeting is not None:
+            await session.meeting.translator.stop()
+
+    def retry_translation():
+        meeting = session.meeting
+        count = meeting.translator.retry_failed() if meeting is not None else 0
+        ui.notify(f'已重新排入 {count} 段翻譯失敗的段落。' if count else '沒有翻譯失敗的段落。', type='info' if count else 'warning')
+
+    def export_meeting():
+        meeting = session.meeting
+        if meeting is None:
+            ui.notify('還沒有會議內容可以匯出。', type='warning')
+            return
+        ui.download.content(meeting.export_text().encode('utf-8-sig'), export_filename(meeting), media_type='text/plain')
+
+    def translation_settings():
+        if session.active or state.loading:
+            ui.notify('轉錄進行中不能修改模型設定。', type='warning')
+            return
+        show_settings_dialog(state, controls.stream_switch, tab='translator')
+
     async def start():
         if session.active or state.loading:
             return
@@ -158,40 +359,17 @@ def build_page():
         if kind not in ('file', 'remote_microphone', 'remote_system') and not controls.device.value:
             ui.notify('請選擇錄音裝置。', type='warning')
             return
-        try:
-            anchor = await ui.run_javascript(
-                f'window.writing.begin({state.settings.context_chars})', timeout=5)
-            writing_context = (anchor['before'], anchor['after'])
-            state.writing_pending = True
-        except Exception as exc:
-            ui.notify(f'無法固定文章插入位置：{exc}', type='negative')
-            return
-        state.loading = True
-        try:
-            state.settings.validate()
-            session.status = '載入本機 ASR 與 ForcedAligner，準備辨識'
-            async with ModelAPI(state.settings) as api:
-                await api.prepare_asr()
-            if state.disconnected:
-                session.status = '頁面已離線，未啟動音訊'
-                state.writing_pending = False
-                await ui.run_javascript('window.writing.rollback()')
+        writing_context = None
+        if not state.meeting_mode:
+            try:
+                anchor = await ui.run_javascript(
+                    f'window.writing.begin({state.settings.context_chars})', timeout=5)
+                writing_context = (anchor['before'], anchor['after'])
+                state.writing_pending = True
+            except Exception as exc:
+                ui.notify(f'無法固定文章插入位置：{exc}', type='negative')
                 return
-            path = state.uploaded_path if kind == 'file' else None
-            session.start(state.settings, kind, controls.device.value, path,
-                          record_audio=bool(controls.record_switch.value) and kind != 'file',
-                          writing_context=writing_context)
-            if path:
-                session.owned_file = path
-                state.uploaded_path = None
-                controls.file_label.set_text('音訊檔已交由背景處理')
-        except Exception as exc:
-            session.error = f'無法開始：{exc}'
-            session.status = '請檢查模型與音訊來源'
-            state.writing_pending = False
-            await ui.run_javascript('window.writing.rollback()')
-        finally:
-            state.loading = False
+        await launch_run(state, session, kind, writing_context)
 
     async def refresh_devices():
         kind = controls.source.value
@@ -262,9 +440,12 @@ def build_page():
 
     with ui.column().classes('shell gap-6'):
         controls = build_source_controls(
-            state, start, refresh_devices, on_upload, change_script, cancel_current)
+            state, start, refresh_devices, on_upload, change_script, cancel_current, toggle_meeting)
         state.controls = controls
-        with ui.card().classes('w-full p-5 gap-3'):
+        state.meeting_widgets = build_meeting_panel(
+            state, start_translation, stop_translation, lambda: open_speakers_dialog(state), export_meeting, translation_settings, retry_translation)
+        state.meeting_widgets.card.set_visibility(False)
+        with ui.card().classes('w-full p-5 gap-3') as article_card:
             ui.label('文章').classes('text-lg font-semibold')
             ui.label('將游標放在插入位置；音訊處理時文章暫停編輯，黃色為最新兩段可修訂文字。').classes('muted text-sm')
             ui.html('<div id="writing-host"></div>', sanitize=False).classes('w-full')
@@ -281,6 +462,36 @@ def build_page():
         await ui.run_javascript(
             f'window.writing.setMode(true, {state.settings.context_chars})')
 
+    def update_meeting_panel(meeting, busy):
+        widgets = state.meeting_widgets
+        has = meeting is not None
+        translating = has and meeting.translator.running
+        widgets.speakers_button.set_enabled(has)
+        widgets.export_button.set_enabled(has)
+        widgets.start_button.set_enabled(has and not translating)
+        widgets.stop_button.set_enabled(translating)
+        widgets.language.set_enabled(not translating)
+        widgets.lag.set_enabled(not translating)
+        failed = len(meeting.translator.failed()) if has else 0
+        widgets.retry_button.set_visibility(failed > 0)
+        widgets.retry_button.set_text(f'重試失敗段落（{failed}）')
+        widgets.retry_button.set_enabled(translating)
+        if not has:
+            widgets.speaker_status.set_text('按「開始轉錄」開始會議；會議內容會自動存到 data/meetings/。')
+            widgets.translation_status.set_text('')
+            widgets.notice.set_visibility(False)
+            return
+        update = meeting.drain()
+        if update:
+            ui.run_javascript('window.meeting.update(' + json.dumps(update, ensure_ascii=False) + ')')
+        widgets.speaker_status.set_text(meeting.speaker.status)
+        widgets.translation_status.set_text(
+            meeting.translator.status if meeting.translator.running or meeting.translator.results else '尚未開始翻譯')
+        problems = '\n'.join(filter(None, (meeting.save_error, meeting.translator.error if meeting.translator.running else '',
+                                                meeting.translator.names_error if meeting.translator.running else '')))
+        widgets.notice.set_text(problems)
+        widgets.notice.set_visibility(bool(problems))
+
     def tick():
         busy = session.active or state.loading
         for control in (controls.source, controls.device, controls.refresh_button,
@@ -295,7 +506,7 @@ def build_page():
         controls.stop_button.set_enabled(
             session.processing and session.source is not None
             and not session.source.stop.is_set())
-        controls.cancel_button.set_enabled(session.active or state.writing_pending)
+        controls.cancel_button.set_enabled(session.active or session.starting or state.writing_starting or state.writing_pending)
         controls.retry_button.set_visibility(
             session.failed_chunk is not None and not session.processing)
         controls.skip_button.set_visibility(session.can_skip_failed_chunk())
@@ -333,7 +544,11 @@ def build_page():
         recording_download.set_enabled(bool(
             session.source and session.source.done.is_set()
             and session.recording_path and session.recording_path.is_file()))
-        if not state.writing_pending:
+        meeting = session.meeting
+        controls.meeting_button.set_enabled(not busy and not state.writing_pending)
+        if state.meeting_mode:
+            update_meeting_panel(meeting, busy)
+        if not writing_in_play(state, session):
             return
         locked, revisable = revisable_split(
             session.corrected, session.segments, session.rolling_start)

@@ -6,7 +6,7 @@ from nicegui import ui
 from .config import shared_mode
 from .ui_settings import show_settings_dialog
 
-def build_source_controls(state, start, refresh_devices, on_upload, change_script, cancel):
+def build_source_controls(state, start, refresh_devices, on_upload, change_script, cancel, toggle_meeting):
     session = state.session
     with ui.row().classes('w-full items-center justify-between'):
         with ui.column().classes('gap-1'):
@@ -33,6 +33,8 @@ def build_source_controls(state, start, refresh_devices, on_upload, change_scrip
                 await change_script('traditional')
             simplified_button = ui.button('轉簡體', on_click=to_simplified).props('outline').tooltip('再按一次可還原轉換前原文；若已編輯則保護新內容')
             traditional_button = ui.button('轉繁體', on_click=to_traditional).props('outline').tooltip('再按一次可還原轉換前原文；若已編輯則保護新內容')
+            meeting_button = ui.button('會議模式', icon='groups', on_click=toggle_meeting).props('outline').tooltip(
+                '演講、研討會、課程：左右兩欄顯示即時語音（標示說話者）與即時翻譯')
             stream_switch = ui.switch('校稿串流預覽', value=state.settings.streaming)
             record_switch = ui.switch('儲存錄音', value=False).tooltip('錄音來源從開始擷取到停止，保存連續 WAV 與同名完整紀錄 JSON')
             def change_stream(e):
@@ -78,7 +80,7 @@ def build_source_controls(state, start, refresh_devices, on_upload, change_scrip
         gap_notice = ui.label('').classes('text-amber-900 notice text-sm font-semibold')
     return SimpleNamespace(
         settings_button=settings_button, source=source,
-        simplified_button=simplified_button, traditional_button=traditional_button,
+        simplified_button=simplified_button, traditional_button=traditional_button, meeting_button=meeting_button,
         stream_switch=stream_switch, record_switch=record_switch,
         device=device, refresh_button=refresh_button, device_note=device_note,
         upload=upload, file_label=file_label, start_button=start_button,

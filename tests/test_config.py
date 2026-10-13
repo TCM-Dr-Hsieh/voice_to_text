@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from voice_app.config import MAX_VOCABULARY_CHARS, Settings
+from voice_app.config import MAX_VOCABULARY_CHARS, Settings, listen_host
 
 
 def test_vocabulary_accepts_25000_characters_and_survives_reload(tmp_path):
@@ -64,3 +64,75 @@ def test_window_must_exceed_overlap():
         Settings(window_seconds=9, overlap_seconds=6.01).validate()
     with pytest.raises(ValueError, match='至少保留 3 秒'):
         Settings(window_seconds=5, overlap_seconds=-.01).validate()
+
+
+# --- meeting mode ---------------------------------------------------------------------------------------------------
+def test_settings_saved_before_meeting_mode_load_and_the_translator_follows_the_proofreader(tmp_path):
+    path = tmp_path / 'settings.json'
+    data = {'editor': {'model': 'my-editor', 'base_url': 'http://10.1.2.3:8080/v1', 'api_key': 'secret', 'domain_terms': '手部衛生'},
+            'window_seconds': 8, 'overlap_seconds': 2, 'unknown_old_key': 1}
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    settings = Settings.load(path)
+    assert settings.translator.model == 'my-editor' and settings.translator.base_url == 'http://10.1.2.3:8080/v1'
+    assert settings.translator.api_key == 'secret' and settings.translator.domain_terms == ''       # a glossary is for one job only
+    assert settings.meeting.target_language == 'English' and settings.meeting.translation_lag == 6
+
+
+def test_meeting_and_translator_settings_roundtrip_and_ignore_unknown_keys(tmp_path):
+    path = tmp_path / 'settings.json'
+    settings = Settings()
+    settings.translator.model, settings.translator.domain_terms = 'translator-x', '手部衛生 = hand hygiene'
+    settings.meeting.target_language, settings.meeting.translation_lag, settings.meeting.text_fill2 = '日本語', 8, True
+    settings.save(path)
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['meeting']['removed_option'] = 1
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    again = Settings.load(path)
+    assert again.translator.model == 'translator-x' and again.translator.domain_terms == '手部衛生 = hand hygiene'
+    assert (again.meeting.target_language, again.meeting.translation_lag, again.meeting.text_fill2) == ('日本語', 8, True)
+
+
+@pytest.mark.parametrize('field, value, message', [
+    ('translation_lag', 2, '延遲語音數'), ('translation_lag', True, '延遲語音數'), ('translation_lag', 61, '延遲語音數'),
+    ('target_language', '   ', '翻譯語言'), ('target_language', 'x' * 61, '翻譯語言'),
+    ('unknown_percentile', 51, '百分位'), ('max_speakers', 1, '人數上限'), ('translation_batch', 0, '補翻'),
+    ('autosave_seconds', 1, '自動存檔'), ('speaker_model_path', '  ', '聲紋模型'), ('translation_context', -1, '上下文'),
+    ('background_rel_db', 0.5, '比常態小聲'), ('background_rel_db', float('nan'), '比常態小聲'), ('background_rel_db', 31, '比常態小聲'),
+    ('background_max_cos', 0.05, '相似度上限'), ('background_max_cos', 0.95, '相似度上限'), ('background_filter', 'yes', '背景人聲過濾'),
+])
+def test_meeting_settings_are_checked(field, value, message):
+    settings = Settings()
+    setattr(settings.meeting, field, value)
+    with pytest.raises(ValueError, match=message):
+        settings.validate()
+
+
+def test_the_language_is_tidied_and_the_translator_endpoint_is_checked():
+    settings = Settings()
+    settings.meeting.target_language = '  Traditional   Chinese '
+    settings.validate()
+    assert settings.meeting.target_language == 'Traditional Chinese'
+    settings.translator.base_url = 'not a url'
+    with pytest.raises(ValueError, match='Base URL'):
+        settings.validate()
+
+
+def test_background_settings_have_safe_defaults_and_survive_a_save(tmp_path):
+    settings = Settings()
+    assert settings.meeting.background_filter is True
+    assert (settings.meeting.background_rel_db, settings.meeting.background_max_cos) == (6.0, 0.45)
+    settings.meeting.background_filter, settings.meeting.background_rel_db, settings.meeting.background_max_cos = False, 8.5, 0.4
+    settings.validate()
+    path = tmp_path / 'settings.json'
+    settings.save(path)
+    again = Settings.load(path)
+    assert (again.meeting.background_filter, again.meeting.background_rel_db, again.meeting.background_max_cos) == (False, 8.5, 0.4)
+
+
+def test_the_page_listens_on_every_interface_unless_the_host_is_set(monkeypatch):
+    monkeypatch.delenv('VOICE_APP_HOST', raising=False)
+    assert listen_host() == '0.0.0.0'
+    monkeypatch.setenv('VOICE_APP_HOST', '')
+    assert listen_host() == '0.0.0.0'
+    monkeypatch.setenv('VOICE_APP_HOST', ' 127.0.0.1 ')
+    assert listen_host() == '127.0.0.1'

@@ -156,6 +156,23 @@ class ModelAPI:
             raise ModelError('校稿串流中途斷線，未套用暫定文字。')
         return clean_editor(result)
 
+    async def chat_json(self, model: ModelConfig, system: str, user: str, *, max_tokens: int, validator,
+                        retries: int = 1, retry_note: str = ''):
+        """One chat request (no streaming) whose reply `validator` turns into a value; it raises ValueError or ModelError for a
+        reply it cannot use. A failed request is repeated `retries` times with `retry_note` added to the system prompt."""
+        last = ''
+        for attempt in range(retries + 1):
+            body = {'model': model.model, 'temperature': model.temperature, 'stream': False, 'max_tokens': max_tokens,
+                    'messages': [{'role': 'system', 'content': system + (retry_note if attempt else '')},
+                                 {'role': 'user', 'content': user}]}
+            try:
+                response = await self.client.post(model.base_url + '/chat/completions', headers=self.headers(model), json=body)
+                await self.check(response, model)
+                return validator(clean_editor(self.message(response.json())))
+            except (httpx.HTTPError, ModelError, ValueError) as exc:
+                last = str(exc) or type(exc).__name__
+        raise ModelError(last)
+
     @staticmethod
     def _rolling_texts(response: str, indexes: list[int]) -> list[str]:
         try:

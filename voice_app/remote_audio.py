@@ -1,6 +1,7 @@
 """Receive browser audio through the existing chunk/recording pipeline."""
 import asyncio
 import json
+import logging
 import queue
 import struct
 import time
@@ -18,15 +19,17 @@ from .api import ModelAPI
 from .config import ROOT
 
 
+LOG = logging.getLogger(__name__)
 REMOTE_PAGES = {}
 STOP_ACK_SECONDS = 8.0
 RECONNECT_SECONDS = 30.0
 STALE_SOCKET_SECONDS = 20.0
 STARTUP_SECONDS = 360.0
 PREPARING_INTERVAL_SECONDS = 5.0
+GO_SECONDS = 10.0                   # how long a start waits for the browser to confirm once the models are loaded
 app.add_static_file(local_file=ROOT / 'voice_app' / 'remote_capture.js', url_path='/remote_capture.js',
                     max_cache_age=0)
-ui.add_head_html('<script src="/remote_capture.js?v=8"></script>', shared=True)
+ui.add_head_html('<script src="/remote_capture.js?v=10"></script>', shared=True)
 
 
 class RemoteAudioSource(AudioSource):
@@ -80,6 +83,9 @@ class RemoteAudioSource(AudioSource):
             self.recording.setnchannels(1)
             self.recording.setsampwidth(2)
             self.recording.setframerate(RATE)
+
+    async def wait_open(self):
+        pass                                          # nothing is opened here: the browser's audio arrives over the socket
 
     def _put(self, chunk):
         if self.cancelled.is_set():
@@ -180,6 +186,125 @@ class RemoteAudioSource(AudioSource):
         self.done.set()
 
 
+def _writes_into_article(state) -> bool:
+    """Voice writing needs the article anchor of the browser; a meeting has no article (the browser sends none)."""
+    return bool(getattr(state, 'writing_mode', False)) and not getattr(state, 'meeting_mode', False)
+
+
+def _control(message: dict) -> dict:
+    """The JSON control message in a received websocket message, or {} if it is audio or not a control message."""
+    text = message.get('text')
+    if text is None:
+        return {}
+    try:
+        control = json.loads(text)
+    except ValueError:
+        return {}
+    return control if isinstance(control, dict) else {}
+
+
+class StartAttempt:
+    """A remote start while the models load, shared by every socket that carries it (the first one, and the ones that rejoin after a
+    connection loss). It ends when the browser confirms ('go') that it is still here, or gives up ('error'). Only a confirmation
+    received AFTER the models are loaded lets the session start, so the last meeting is never replaced for a browser that is gone:
+    a count of sockets cannot tell a live one from one that has just closed."""
+
+    def __init__(self, session_id: str):
+        loop = asyncio.get_running_loop()
+        self.session_id = session_id
+        self.prepared = loop.create_future()          # the models are loaded and the browser has been asked to confirm
+        self.verdict = loop.create_future()           # True: confirmed; a string: the browser gave up, and why
+
+    def decide(self, outcome):
+        if not self.verdict.done():
+            self.verdict.set_result(outcome)
+
+    def hear(self, message: dict, early: list):
+        """Everything the browser says while the start is pending goes through here, whichever socket it came on."""
+        control = _control(message)
+        kind = control.get('type')
+        if kind == 'go':
+            if self.prepared.done():
+                self.decide(True)
+            return                                      # never passed on: the receive loop does not know it
+        if kind == 'error' and not self.verdict.done():
+            self.decide('遠端音訊錯誤：' + str(control.get('message', '未知錯誤'))[:200])
+            return
+        early.append(message)                           # anything else (or an error after the confirmation) is for the receive loop
+
+
+async def _carry(websocket, attempt: StartAttempt, early: list) -> bool:
+    """Serve one socket of `attempt` until it is decided: 'preparing' while the models load, 'prepared' once they are, and whatever
+    the browser sends goes to `attempt.hear`. False if this socket is gone before that."""
+    receiving = None
+    told = False
+    try:
+        while not attempt.verdict.done():
+            note = None
+            if not attempt.prepared.done():
+                note = {'type': 'preparing'}
+            elif not told:
+                note, told = {'type': 'prepared'}, True
+            if note is not None:
+                try:
+                    await asyncio.wait_for(websocket.send_json(note), 1)
+                except (OSError, RuntimeError, WebSocketDisconnect, asyncio.TimeoutError):
+                    pass  # Model loading continues for a replacement socket.
+            if receiving is None:
+                receiving = asyncio.ensure_future(websocket.receive())
+            waiting = {receiving, attempt.verdict}
+            if not attempt.prepared.done():
+                waiting.add(attempt.prepared)
+            await asyncio.wait(waiting, timeout=PREPARING_INTERVAL_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+            if receiving.done():
+                heard, receiving = receiving, None
+                try:
+                    message = heard.result()
+                except (OSError, RuntimeError, WebSocketDisconnect):
+                    return False
+                if message.get('type') == 'websocket.disconnect':
+                    return False
+                attempt.hear(message, early)
+        return True
+    finally:
+        if receiving is not None:
+            receiving.cancel()
+            await asyncio.gather(receiving, return_exceptions=True)
+            if not receiving.cancelled() and receiving.exception() is None:
+                message = receiving.result()            # it arrived in the very instant it was cancelled: same handling
+                if message.get('type') != 'websocket.disconnect':
+                    attempt.hear(message, early)
+
+
+async def _finish(*cleanups):
+    """Run the cleanups to their end even if the caller is cancelled (once or many times) meanwhile, and pass the cancellation
+    on only then: a cleanup cut short leaves files and connections behind. One cleanup failing does not stop the others; once
+    all are done a failure is not lost: it is logged, and raised unless a cancellation is on its way (that one goes first)."""
+    tasks = [asyncio.ensure_future(cleanup) for cleanup in cleanups]
+    # A cancellation may already be on its way: the caller can be running this from a `finally` it entered with a CancelledError.
+    cancelled = asyncio.current_task().cancelling() > 0
+    while True:
+        try:
+            results = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+    failures = [result for result in results if isinstance(result, BaseException)]
+    for failure in failures:
+        LOG.error('遠端音訊的清理失敗：%s', failure, exc_info=failure)
+    if cancelled:
+        raise asyncio.CancelledError
+    if failures:
+        raise failures[0]
+
+
+async def _close(websocket):
+    try:
+        await websocket.close()
+    except Exception:
+        pass
+
+
 @app.websocket('/remote-audio/{token}')
 async def remote_audio_socket(websocket: WebSocket, token: str):
     state = REMOTE_PAGES.get(token)
@@ -189,6 +314,8 @@ async def remote_audio_socket(websocket: WebSocket, token: str):
         return
     await websocket.accept()
     source = None
+    meeting = None
+    early = []                    # messages that arrived while the models were loading, for the receive loop to handle first
     owns_source = False
     loading_claimed = False
     try:
@@ -204,14 +331,26 @@ async def remote_audio_socket(websocket: WebSocket, token: str):
                             (isinstance(candidate, RemoteAudioSource) and
                              candidate.session_id == session_id)))
         if hello.get('type') == 'resume' or rejoining_start:
+            attempt = state.remote_attempt
+            if (attempt is not None and attempt.session_id == session_id and state.loading
+                    and not attempt.verdict.done()):
+                # The start this browser began is still waiting for the models or for its confirmation: this socket carries
+                # it on (it may be the one that confirms), and is gone if it closes first.
+                if not await _carry(websocket, attempt, early):
+                    return
+                if attempt.verdict.result() is not True:
+                    raise ValueError(attempt.verdict.result())      # the start ended without a confirmation: this socket is told why
+            told_at = time.monotonic()
             while (state.loading and getattr(state, 'remote_start_id', '') == session_id and
                    (not isinstance(candidate, RemoteAudioSource) or
                     candidate.session_id != session_id)):
-                try:
-                    await asyncio.wait_for(websocket.send_json({'type': 'preparing'}), 1)
-                except (OSError, RuntimeError, WebSocketDisconnect, asyncio.TimeoutError):
-                    return
-                await asyncio.sleep(PREPARING_INTERVAL_SECONDS)
+                if time.monotonic() - told_at >= PREPARING_INTERVAL_SECONDS:
+                    try:
+                        await asyncio.wait_for(websocket.send_json({'type': 'preparing'}), 1)
+                    except (OSError, RuntimeError, WebSocketDisconnect, asyncio.TimeoutError):
+                        return
+                    told_at = time.monotonic()
+                await asyncio.sleep(0.05)
                 if REMOTE_PAGES.get(token) is not state:
                     return
                 candidate = state.session.source
@@ -241,7 +380,8 @@ async def remote_audio_socket(websocket: WebSocket, token: str):
             state.loading = loading_claimed = True
             state.remote_start_id = session_id
             writing_context = None
-            if getattr(state, 'writing_mode', False):
+            writing = _writes_into_article(state)
+            if writing:
                 anchor = hello.get('writing_context')
                 if (not isinstance(anchor, dict) or
                         not all(isinstance(anchor.get(key), str) and len(anchor[key]) <= 20000
@@ -250,30 +390,57 @@ async def remote_audio_socket(websocket: WebSocket, token: str):
                 writing_context = (anchor['before'], anchor['after'])
             state.settings.validate()
             state.session.status = '載入本機 ASR 與 ForcedAligner，準備接收遠端音訊'
-            async with ModelAPI(state.settings) as api:
-                prepare_task = asyncio.create_task(asyncio.wait_for(api.prepare_asr(), STARTUP_SECONDS))
-                try:
-                    while not prepare_task.done():
-                        try:
-                            await asyncio.wait_for(websocket.send_json({'type': 'preparing'}), 1)
-                        except (OSError, RuntimeError, WebSocketDisconnect, asyncio.TimeoutError):
-                            pass  # Model loading continues for a replacement socket.
-                        await asyncio.wait({prepare_task}, timeout=PREPARING_INTERVAL_SECONDS)
+            attempt = state.remote_attempt = StartAttempt(session_id)
+            carrying = None
+            try:
+                async with ModelAPI(state.settings) as api:
+                    prepare_task = asyncio.create_task(asyncio.wait_for(api.prepare_asr(), STARTUP_SECONDS))
+                    carrying = asyncio.create_task(_carry(websocket, attempt, early))
                     try:
-                        await prepare_task
-                    except asyncio.TimeoutError as exc:
-                        raise ValueError('ASR 準備逾時，請檢查模型與執行環境。') from exc
-                finally:
-                    if not prepare_task.done():
-                        prepare_task.cancel()
-                        await asyncio.gather(prepare_task, return_exceptions=True)
+                        # The models can take minutes to load: the browser may give up meanwhile (the shared audio ended, it
+                        # could not start) and says so, which ends the start at once.
+                        await asyncio.wait({prepare_task, attempt.verdict}, return_when=asyncio.FIRST_COMPLETED)
+                        if attempt.verdict.done() and attempt.verdict.result() is not True:
+                            raise ValueError(attempt.verdict.result())
+                        try:
+                            await prepare_task
+                        except asyncio.TimeoutError as exc:
+                            raise ValueError('ASR 準備逾時，請檢查模型與執行環境。') from exc
+                    finally:
+                        if not prepare_task.done():
+                            prepare_task.cancel()
+                            await asyncio.gather(prepare_task, return_exceptions=True)
+                # The models are loaded. The meeting is made now, so that nothing slow is left between the browser's word and
+                # the start; then the browser is asked to confirm (on this socket, or on the one that replaced it): only its
+                # confirmation, given AFTER this point, starts anything.
+                meeting = (await state.prepare_meeting() if getattr(state, 'meeting_mode', False)
+                           and state.prepare_meeting is not None else None)
+                attempt.prepared.set_result(True)
+                try:
+                    await asyncio.wait_for(asyncio.shield(attempt.verdict), GO_SECONDS)
+                except asyncio.TimeoutError:
+                    # An error, not a silent close: the browser's script has always stopped on an error, while a page that does
+                    # not know 'prepared' would take a close for a lost connection and keep reconnecting.
+                    raise ValueError('遠端音訊沒有回應確認，未啟動錄音；請重新按「開始轉錄」。') from None
+                if attempt.verdict.result() is not True:
+                    raise ValueError(attempt.verdict.result())
+            except BaseException as exc:
+                # However this start ends (the models fail, the confirmation never comes, the handler is cancelled), every other
+                # socket that is carrying it ends with it and is told why.
+                attempt.decide(str(exc) or '遠端音訊啟動已中止。')
+                raise
+            finally:
+                state.remote_attempt = None
+                if carrying is not None:
+                    carrying.cancel()
+                    await asyncio.gather(carrying, return_exceptions=True)
             if (REMOTE_PAGES.get(token) is not state or
                     state.controls.source.value != kind):
                 raise ValueError('頁面已關閉或音訊來源已變更，未啟動遠端錄音。')
-            state.session.start(state.settings, kind,
-                                record_audio=bool(state.controls.record_switch.value),
-                                writing_context=writing_context)
-            state.writing_pending = bool(getattr(state, 'writing_mode', False))
+            await state.session.start(state.settings, kind,
+                                      record_audio=bool(state.controls.record_switch.value),
+                                      writing_context=writing_context, meeting=meeting)
+            state.writing_pending = writing
             source = state.session.source
             assert isinstance(source, RemoteAudioSource)
             source.session_id = session_id
@@ -309,7 +476,7 @@ async def remote_audio_socket(websocket: WebSocket, token: str):
                 source_error = '遠端停止時未收到音訊末尾；錄音標示未完成。'
                 break
             try:
-                message = await asyncio.wait_for(websocket.receive(), .25)
+                message = early.pop(0) if early else await asyncio.wait_for(websocket.receive(), .25)
             except asyncio.TimeoutError:
                 continue
             except (OSError, RuntimeError, WebSocketDisconnect):
@@ -382,12 +549,15 @@ async def remote_audio_socket(websocket: WebSocket, token: str):
         except Exception:
             pass
     finally:
+        # The page state first, with nothing to wait for: no cancel can cut it short.
         if owns_source and source is not None and not source.done.is_set() and not source.cancelled.is_set():
             source.suspend(websocket)
         if loading_claimed:
             state.loading = False
             state.remote_start_id = ''
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+            state.remote_attempt = None
+        # Then what has to be waited for. However this ended (an error, or this handler being cancelled), a meeting the session
+        # never started with is thrown away (no reserved empty file, no open connections), and the socket is closed; both run
+        # to the end even if another cancel comes meanwhile.
+        leftover = meeting if meeting is not None and state.session.meeting is not meeting else None
+        await _finish(*([leftover.discard()] if leftover is not None else []), _close(websocket))

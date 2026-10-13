@@ -28,13 +28,31 @@ The main components and the licenses declared in their package metadata at the t
   Hugging Face huggingface_hub         Apache-2.0
   safetensors                          Apache-2.0
   qwen-asr                             Apache-2.0
+  ONNX Runtime (onnxruntime)           MIT
+  kaldi-native-fbank                   Apache-2.0
+  opencc-python-reimplemented          Apache-2.0
+  protobuf                             BSD-3-Clause
+  flatbuffers                          Apache-2.0
 
   Qwen/Qwen3-ASR-1.7B                  Apache-2.0 (model weights, downloaded at install time)
   Qwen/Qwen3-ForcedAligner-0.6B        Apache-2.0 (model weights, downloaded at install time)
+  3D-Speaker CAM++ zh-en "advanced"    Voiceprint model of the meeting mode. Published by the 3D-Speaker project (Tongyi Lab) on ModelScope as
+                                       iic/speech_campplus_sv_zh_en_16k-common_advanced; the license field of its ModelScope page
+                                       reads "Apache License 2.0" (checked 2026-10-09; the page names no license file and does not
+                                       name the training data, only "large-scale Chinese and English speaker datasets").
+                                       The file the installer downloads is not one published by the authors: it is the third-party ONNX
+                                       conversion csukuangfj/speaker-embedding-models (pinned commit, SHA-256 in
+                                       tools/model_manifest.json), downloaded at install time; this project does not redistribute it.
+                                       That repository carries no license statement; the file's own metadata names the model above as
+                                       its source. Apache-2.0 permits converting the weights to another format; whoever redistributes
+                                       the converted file must include the license text and the original notices, which the conversion
+                                       repository does not do. This is a statement of facts, not legal advice: if you must redistribute
+                                       the model or have compliance requirements, confirm them yourself.
 
 The full list of installed packages is pinned in constraints.txt (UI environment) and
 requirements-asr.txt (speech-recognition environment). Review the license of each package
 before redistributing a bundled copy of an installed environment.
 
-The proofreading step sends transcribed text to the OpenAI-compatible chat service you
-configure; the model and service you choose are subject to their own terms.
+The proofreading, the speaker fill and the translation send transcribed text to the OpenAI-compatible chat services you
+configure; the models and services you choose are subject to their own terms. Voiceprints are kept in memory only and are
+never written to a file.

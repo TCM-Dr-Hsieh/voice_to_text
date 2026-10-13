@@ -8,7 +8,7 @@
     2. 找到 Python 3.12（找不到時，經你同意用 winget 安裝）
     3. 建立 UI 用的 .venv 並安裝套件
     4. 建立獨立的 ASR 用 .venv-asr（含 CUDA 版 PyTorch，約 4 GB）
-    5. 從 Hugging Face 下載 Qwen3-ASR-1.7B 與 Qwen3-ForcedAligner-0.6B（約 6.1 GB，固定版本）
+    5. 從 Hugging Face 下載 Qwen3-ASR-1.7B 與 Qwen3-ForcedAligner-0.6B，以及會議模式用的說話者聲紋模型（共約 6.1 GB，固定版本）
     6. 寫入 data\settings.json
     7. 健檢（含實際載入 ASR 模型辨識一次）
   可重複執行：已完成的步驟會略過，下載可續傳。記錄寫在 setup.log。
@@ -282,7 +282,7 @@ try {
     Install-Pip $uiPy @('--upgrade', 'pip')
     $reqFile = $(if ($Dev) { 'requirements-dev.txt' } else { 'requirements.txt' })
     Install-Pip $uiPy @('-r', (Join-Path $Root $reqFile), '-c', (Join-Path $Root 'constraints.txt'))
-    Invoke-Checked '確認 UI 套件' $uiPy @('-c', "import nicegui, httpx, numpy, soundcard, av; print('UI packages OK')")
+    Invoke-Checked '確認 UI 套件' $uiPy @('-c', "import nicegui, httpx, numpy, soundcard, av, onnxruntime, kaldi_native_fbank, opencc; print('UI packages OK')")
     Write-Ok '.venv 就緒'
 
     # ------------------------------------------------------------------ 4. ASR venv
@@ -310,7 +310,7 @@ try {
         Write-Step 5 '下載模型（已略過）'
         Write-Note '之後可執行：.venv-asr\Scripts\python.exe tools\download_models.py --write-config'
     } else {
-        Write-Step 5 '下載語音模型（Qwen3-ASR-1.7B 與 ForcedAligner-0.6B，共約 6.1 GB，可續傳）'
+        Write-Step 5 '下載語音模型（Qwen3-ASR-1.7B、ForcedAligner-0.6B 與說話者聲紋模型，共約 6.1 GB，可續傳）'
         $dlArgs = @((Join-Path $Root 'tools\download_models.py'), '--write-config')
         # 明確指定 -ModelsDir 時以它為準；否則才沿用 data\settings.json 裡已指到完整模型的資料夾。
         if ($ModelsDir) { $dlArgs += @('--dir', $ModelsDir) } else { $dlArgs += '--reuse-config' }
@@ -349,7 +349,7 @@ try {
     }
     Write-Host "安裝完成！（耗時 $minutes 分鐘）" -ForegroundColor Green
     Write-Host '  啟動：    雙擊 start.cmd（或 .venv\Scripts\python.exe app.py --open）'
-    Write-Host '  網址：    http://127.0.0.1:2020/'
+    Write-Host '  網址：    http://127.0.0.1:2020/（本機）；服務監聽 0.0.0.0:2020，區網其他電腦可用本機 IP 連入（無登入驗證；只給本機用請設 VOICE_APP_HOST=127.0.0.1）'
     Write-Host '  LLM：     本腳本不安裝校稿用的 LLM 伺服器。請在「模型設定」填入你的 LLM 網址與模型，'
     Write-Host '            或用 -LlmUrl / -LlmModel 重新執行本腳本。'
     exit 0

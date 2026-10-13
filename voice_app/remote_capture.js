@@ -43,6 +43,7 @@ const RETRY_DELAY_MS = 700;
 const HEARTBEAT_MS = 5000;
 const RESPONSE_TIMEOUT_MS = 15000;
 const STARTUP_TIMEOUT_MS = 375000;
+const PIPELINE_TIMEOUT_MS = 10000;
 const MAX_PENDING_BYTES = 32 * 1024 * 1024;
 const MAX_SOCKET_BYTES = 512 * 1024;
 
@@ -77,7 +78,8 @@ class RemoteCapture {
     this.lastServerReply = 0;
     this.reconnectStarted = 0;
     this.flushResolve = null;
-    this.audioStarting = null;
+    this.sourceNode = null;
+    this.generation = 0;               // one number per start (and per cleanup): work left over from an earlier one is dropped
   }
 
   async start(kind, token) {
@@ -106,6 +108,22 @@ class RemoteCapture {
       this.token = token;
       this.sessionId = crypto.randomUUID();
       this.writingContext = writingContext;
+      // The audio pipeline is built before the server is asked to start anything. If this browser cannot run it, nothing was
+      // started: the last meeting stays as it was and the article is given back, instead of a run the server already committed
+      // to that never receives any audio.
+      const generation = ++this.generation;
+      const preparing = this.prepareAudio(generation);
+      preparing.catch(() => {});               // an attempt given up on may still fail later: nobody is left to care
+      let timer;
+      try {
+        await Promise.race([preparing, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('瀏覽器的音訊處理元件載入逾時。')), PIPELINE_TIMEOUT_MS);
+        })]);
+      } catch (error) {
+        if (!this.sessionId) return;           // the shared audio ended meanwhile: fail() has already cleaned up and told the user
+        throw error;
+      } finally { clearTimeout(timer); }
+      if (!this.sessionId) return;
       this.startupTimer = setTimeout(() => {
         if (this.sessionId && !this.everReady) {
           this.fail('ASR 準備超過 375 秒；已停止等待並解除文章鎖定。');
@@ -159,13 +177,9 @@ class RemoteCapture {
         this.lastSent = next - 1;
         this.stopSent = false;
         this.startHeartbeat(socket);
-        if (!this.node && !this.stopRequested) {
-          try {
-            if (!this.audioStarting) this.audioStarting = this.beginAudio();
-            await this.audioStarting;
-          }
+        if (this.node && !this.sourceNode && !this.stopRequested) {
+          try { this.connectAudio(); }
           catch (error) { this.fail(`無法開始遠端音訊：${error.message}`); return; }
-          finally { this.audioStarting = null; }
         }
         if (this.socket !== socket || !this.serverReady) return;
         if (this.node) this.sendFormat();
@@ -187,6 +201,14 @@ class RemoteCapture {
         this.reconnectStarted = 0;
         clearTimeout(this.deadlineTimer);
         this.deadlineTimer = null;
+      } else if (message.type === 'prepared') {
+        // The models are loaded and the server asks whether this browser is still here and ready: only this answer starts the
+        // recording (a browser that failed or went away has no socket left to answer on).
+        this.reconnectStarted = 0;
+        clearTimeout(this.deadlineTimer);
+        this.deadlineTimer = null;
+        try { socket.send(JSON.stringify({type: 'go'})); }
+        catch (_) { socket.close(); }
       } else if (message.type === 'finished' || message.type === 'cancel') {
         this.cleanup();
       } else if (message.type === 'retry') {
@@ -286,15 +308,19 @@ class RemoteCapture {
     }
   }
 
-  async beginAudio() {
+  async prepareAudio(generation) {
+    // Everything here can fail in a browser (the worklet module, the node, the context that may not start): all of it is
+    // done, and running, before the server hears of this recording. Nothing is fed in yet, so no audio is buffered while the
+    // models load. The context is published at once (a cleanup has to be able to close it while the module is still loading);
+    // the node only when this attempt is still the current one: a start that was given up on (it timed out) can finish much
+    // later, after a newer start began, and must not touch that one.
     const context = new AudioContext();
     this.context = context;
     const url = URL.createObjectURL(new Blob([workletSource], {type: 'text/javascript'}));
     try { await context.audioWorklet.addModule(url); }
     finally { URL.revokeObjectURL(url); }
-    if (this.stopping) return;
+    if (generation !== this.generation || this.stopping) return;
     const node = new AudioWorkletNode(context, 'voice-pcm');
-    this.node = node;
     node.port.onmessage = event => {
       if (event.data instanceof Float32Array) this.queueFrame(event.data);
       else if (event.data === 'finished' && this.flushResolve) {
@@ -302,9 +328,20 @@ class RemoteCapture {
         this.flushResolve = null;
       }
     };
-    context.createMediaStreamSource(this.stream).connect(node);
     node.connect(context.destination); // The worklet outputs silence, so there is no echo.
     await context.resume();
+    if (generation !== this.generation) {
+      node.port.onmessage = null;
+      node.disconnect();
+      return;
+    }
+    this.node = node;
+  }
+
+  connectAudio() {
+    // The server has started the recording: now the shared audio goes into the pipeline.
+    this.sourceNode = this.context.createMediaStreamSource(this.stream);
+    this.sourceNode.connect(this.node);
   }
 
   sendFormat() {
@@ -370,6 +407,7 @@ class RemoteCapture {
   }
 
   cleanup() {
+    this.generation++;
     if (this.writingPrepared && !this.everReady) window.writing?.rollback();
     clearTimeout(this.retryTimer);
     clearTimeout(this.deadlineTimer);
@@ -389,9 +427,8 @@ class RemoteCapture {
     const socket = this.socket;
     this.socket = null;
     if (socket) socket.close();
-    this.node = this.context = this.stream = null;
+    this.node = this.context = this.stream = this.sourceNode = null;
     this.flushResolve = null;
-    this.audioStarting = null;
     this.captureError = '';
     this.kind = this.token = this.sessionId = null;
     this.writingContext = null;

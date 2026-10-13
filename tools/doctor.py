@@ -56,7 +56,7 @@ def check_ui_environment():
            str(sys.executable) if inside else f'不是專案的 .venv（{sys.prefix}）；建議用 .venv\\Scripts\\python.exe 執行')
     if sys.version_info[:2] != (3, 12):
         report('WARN', 'Python 版本', '建議使用 3.12（套件鎖定檔以 3.12 為準）')
-    for module in ('nicegui', 'httpx', 'numpy', 'soundcard', 'av'):
+    for module in ('nicegui', 'httpx', 'numpy', 'soundcard', 'av', 'onnxruntime', 'kaldi_native_fbank', 'opencc'):
         try:
             imported = importlib.import_module(module)
             report('OK', f'套件 {module}', getattr(imported, '__version__', ''))
@@ -111,6 +111,30 @@ def check_models(settings: Settings, deep: bool = False):
                                   '（可能是其他版本，相容性與辨識品質未經驗證）')
         else:
             report('OK', label, f'{folder}（與固定版本相符{"，已核對全部檔案的內容雜湊" if deep else ""}）')
+
+
+def check_speaker(settings: Settings, deep: bool = False):
+    """The voiceprint model of the meeting mode: packages, the model file, its version, and one real run."""
+    from voice_app.speaker.embedder import DIMENSION, OnnxEmbedder, availability
+    import modelcheck
+    from voice_app.config import resolve_path
+    path = resolve_path(settings.meeting.speaker_model_path)
+    reason = availability(path)
+    if reason:                                   # the app still works without it (a meeting then has no speaker marks)
+        report('WARN', '說話者聲紋模型', f'{reason}（會議模式仍可使用，但不會標示說話者）')
+        return
+    drift = modelcheck.problems(path.parent, modelcheck.REPOS['speaker'], deep=deep)
+    try:
+        import numpy as np
+        vector = OnnxEmbedder(path).embed(np.random.default_rng(0).normal(0, 0.1, 12800).astype(np.float32))
+        assert vector is not None and vector.shape == (DIMENSION,)
+    except Exception as exc:
+        report('WARN', '說話者聲紋模型', f'{path} 無法執行：{type(exc).__name__}: {exc}')
+        return
+    if drift:
+        report('WARN', '說話者聲紋模型', f'{path} 與本程式驗證的固定版本不同：{modelcheck.summarize(drift)}')
+    else:
+        report('OK', '說話者聲紋模型', f'{path}（與固定版本相符{"，已核對內容雜湊" if deep else ""}，實際跑通一次）')
 
 
 def check_microphone():
@@ -189,6 +213,7 @@ async def main() -> int:
     if not args.skip_asr:
         check_asr_environment()
         check_models(settings, deep=args.verify_models)
+        check_speaker(settings, deep=args.verify_models)
     check_microphone()
     if not args.no_llm:
         await check_llm(settings)

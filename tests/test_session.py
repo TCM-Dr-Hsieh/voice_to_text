@@ -184,7 +184,7 @@ async def test_retry_preserves_failed_audio(monkeypatch, tmp_path):
     path = tmp_path / 'speech.wav'
     path.write_bytes(wav_bytes(np.full(RATE * 2, .1)))
     session = Session()
-    session.start(Settings(), 'file', path=path)
+    await session.start(Settings(), 'file', path=path)
     await session.task
     assert session.failed_chunk is not None and not session.segments
     session.retry()

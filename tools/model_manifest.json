@@ -100,6 +100,16 @@
           "git_sha1": "4783fe10ac3adce15ac8f358ef5462739852c569"
         }
       }
+    },
+    "csukuangfj/speaker-embedding-models": {
+      "revision": "0743f301363dec56491a490f6d6cbc9d67f9a3bf",
+      "files": {
+        "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": {
+          "size": 28281164,
+          "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+          "git_sha1": null
+        }
+      }
     }
   }
 }

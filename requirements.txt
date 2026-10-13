@@ -3,3 +3,6 @@ httpx>=0.28,<1
 numpy>=1.26,<2
 SoundCard>=0.4.3,<0.5
 av>=14,<17
+opencc-python-reimplemented>=0.1.7,<1
+onnxruntime>=1.30,<2
+kaldi-native-fbank>=1.22,<2

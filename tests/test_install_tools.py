@@ -131,6 +131,10 @@ def test_shipped_manifest_matches_the_pinned_revisions_in_download_models():
     for model in download_models.MODELS.values():
         spec = manifest['models'][model.repo]
         assert spec['revision'] == model.revision
+        if model.files:                                              # the voiceprint model: one file, named and hashed
+            assert set(spec['files']) == set(model.files)
+            assert all(info['sha256'] and info['size'] > 10 ** 6 for info in spec['files'].values())
+            continue
         assert 'config.json' in spec['files'] and any(n.endswith('.safetensors') for n in spec['files'])
         assert not any(n.endswith(('.md', '.png', '.jpg')) for n in spec['files'])     # ignored files stay out
     assert modelcheck.REPOS == {key: model.repo for key, model in download_models.MODELS.items()}
@@ -210,3 +214,32 @@ def test_setup_script_refuses_a_python_that_is_not_one_working_path():
     text = (ROOT / 'setup.ps1').read_text(encoding='utf-8-sig')
     assert '$python -isnot [string] -or -not (Test-Python312 $python)' in text      # a clear message, not 無法辨識 ...
     assert text.index('$python -isnot [string]') < text.index('Write-Ok "Python 3.12：$python"')
+
+
+# --- the voiceprint model of the meeting mode ----------------------------------------------------------------------
+def test_the_voiceprint_model_is_the_third_pinned_download_and_defaults_match():
+    speaker = download_models.MODELS['speaker']
+    assert speaker.files == (download_models.SPEAKER_FILE,) and speaker.repo == 'csukuangfj/speaker-embedding-models'
+    assert len(speaker.revision) == 40 and speaker.size_gb < 0.1
+    assert Settings().meeting.speaker_model_path.endswith(download_models.SPEAKER_FILE)
+    assert modelcheck.REPOS['speaker'] == speaker.repo
+
+
+def test_the_configured_voiceprint_folder_is_reused_only_when_the_named_file_is_there(tmp_path, monkeypatch):
+    path = tmp_path / 'settings.json'
+    monkeypatch.setattr(download_models, 'SETTINGS_PATH', path)
+    speaker = download_models.MODELS['speaker']
+    folder = tmp_path / 'vp'
+    folder.mkdir()
+    path.write_text(json.dumps({'meeting': {'speaker_model_path': str(folder / speaker.files[0])}}), encoding='utf-8')
+    assert download_models.configured_folder(speaker) is None                     # the file is not there yet
+    (folder / speaker.files[0]).write_bytes(b'onnx')
+    assert download_models.configured_folder(speaker) == folder
+    path.write_text(json.dumps({'meeting': {'speaker_model_path': str(folder / 'other.onnx')}}), encoding='utf-8')
+    assert download_models.configured_folder(speaker) is None                     # another file name is not ours to keep
+
+
+def test_the_voiceprint_model_check_compares_with_the_manifest_without_the_qwen_validation(tmp_path):
+    speaker = download_models.MODELS['speaker']
+    ok, why = download_models.is_valid(tmp_path, speaker)
+    assert not ok and '缺少' in why                                                # nothing there: reported, not crashed

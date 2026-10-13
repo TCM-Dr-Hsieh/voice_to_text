@@ -4,6 +4,15 @@ import math
 import unicodedata
 
 
+# How far the aligner may place a word past the end of the audio it was given: where a word may START and where any word may END, 0.2 s.
+# Only the END of the LAST word may go further, 0.8 s: a word that the end of the window cuts off is stretched past it (up to 0.52 s on
+# real recordings; 2 windows in 49 went past 0.2 s), though it starts no further out than the ordinary 0.2 s (a start may lie a little
+# past the end of the audio: "system" began at 9.12 s of 9). Such a word is kept, its times held at the end of the audio; anything else
+# further out means the times are broken, and the run waits for a retry.
+SLACK_SECONDS = 0.2
+EDGE_SECONDS = 0.8
+
+
 class AlignmentError(RuntimeError):
     pass
 
@@ -41,8 +50,9 @@ def map_alignment(text, items, offset, duration):
             raise AlignmentError('對齊欄位無效。') from exc
         if not token or not compact.startswith(token, cursor):
             raise AlignmentError('對齊文字與 ASR 原稿不一致，請重試該段。')
+        end_limit = duration + (EDGE_SECONDS if index == len(items) else SLACK_SECONDS)
         if (not math.isfinite(start) or not math.isfinite(end) or
-                start < 0 or end < start or end > duration + 0.2 or
+                start < 0 or end < start or start > duration + SLACK_SECONDS or end > end_limit or
                 start < last_start or end < last_end):
             raise AlignmentError(
                 '對齊時間超出音訊或不是遞增順序。'
@@ -51,7 +61,7 @@ def map_alignment(text, items, offset, duration):
         begin = positions[cursor]
         cursor += len(token)
         finish = positions[cursor - 1] + 1
-        result.append(TimedText(text[begin:finish], offset + start, offset + min(end, duration), begin, finish))
+        result.append(TimedText(text[begin:finish], offset + min(start, duration), offset + min(end, duration), begin, finish))
         last_start, last_end = start, end
     if cursor != len(compact):
         raise AlignmentError('對齊未覆蓋所有原稿，已保留音訊等待重試。')

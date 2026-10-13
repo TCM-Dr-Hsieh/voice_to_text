@@ -41,7 +41,7 @@ async function main() {
   capture.kind = 'remote_microphone';
   capture.token = 'test-token';
   capture.node = {disconnect() {}, port: {postMessage() { capture.flushResolve?.(); }}};
-  capture.context = {sampleRate: 48000, close() {}};
+  capture.context = {sampleRate: 48000, close() {}, createMediaStreamSource: () => ({connect() {}})};
   capture.stream = {getTracks: () => []};
   capture.openSocket(false, {before: '', after: ''});
   const first = FakeWebSocket.sockets[0];
@@ -126,6 +126,7 @@ async function main() {
   Object.defineProperty(global, 'crypto', {configurable: true,
     value: {randomUUID: () => 'startup-deadline-1234'}});
   global.alert = message => { alertText = message; };
+  const audio = installFakeAudio();
   await capture.start('remote_microphone', 'test-token');
   assert.equal(typeof startupDeadline, 'function', alertText);
   assert.equal(capture.sessionId, 'startup-deadline-1234');
@@ -134,7 +135,154 @@ async function main() {
   assert.equal(rolledBack, true);
   assert.equal(stopped, true);
   assert.match(alertText, /375 秒/);
+
+  // Once the models are loaded the server asks whether this browser is still here ('prepared'): its 'go' is what starts the
+  // recording. Only the socket the browser is using answers; a socket it has already given up on does not.
+  capture.sessionId = 'confirm-session-1234';
+  capture.kind = 'remote_microphone';
+  capture.token = 'test-token';
+  capture.openSocket(false, {before: '', after: ''});
+  const confirming = FakeWebSocket.sockets.at(-1);
+  confirming.open();
+  await confirming.message({type: 'preparing'});
+  assert.equal(confirming.sent.filter(value => JSON.parse(value).type === 'go').length, 0);
+  await confirming.message({type: 'prepared'});
+  assert.deepEqual(JSON.parse(confirming.sent.at(-1)), {type: 'go'});
+  const abandoned = capture.socket;
+  capture.socket = null;                                                  // the browser moved on to another socket
+  const before = confirming.sent.length;
+  await abandoned.message({type: 'prepared'});
+  assert.equal(abandoned.sent.length, before, 'a socket that is no longer in use must not answer');
+  capture.cleanup();
+
+  // The browser's audio pipeline is built, and running, BEFORE the server is asked to start (so a pipeline that cannot start
+  // never reaches the server: the last meeting stays, the article cursor is given back). The shared audio only goes in after
+  // the server says ready.
+  const socketsBefore = FakeWebSocket.sockets.length;
+  rolledBack = false;
+  audio.log.length = 0;
   global.setTimeout = nativeSetTimeout;
+  await capture.start('remote_microphone', 'test-token');
+  assert.equal(FakeWebSocket.sockets.length, socketsBefore + 1, alertText);
+  assert.deepEqual(audio.log, ['context', 'addModule', 'node', 'resume'], 'pipeline up, nothing fed in yet');
+  const started = FakeWebSocket.sockets.at(-1);
+  started.open();
+  assert.equal(JSON.parse(started.sent[0]).type, 'start');
+  await started.message({type: 'ready', next_sequence: 0});
+  assert.deepEqual(audio.log, ['context', 'addModule', 'node', 'resume', 'source', 'connect']);
+  assert.equal(JSON.parse(started.sent[1]).type, 'format');
+  await started.message({type: 'resumed', next_sequence: 0});             // a reconnect never feeds the audio in twice
+  assert.equal(audio.log.filter(entry => entry === 'source').length, 1);
+  capture.cleanup();
+
+  for (const [failure, reason] of [['addModule', /worklet/], ['node', /AudioWorkletNode/], ['resume', /not allowed/]]) {
+    const sockets = FakeWebSocket.sockets.length;
+    audio.failure = failure;
+    audio.log.length = 0;
+    rolledBack = stopped = false;
+    alertText = '';
+    await capture.start('remote_microphone', 'test-token');
+    assert.equal(FakeWebSocket.sockets.length, sockets, `${failure}: the server must not be contacted`);
+    assert.equal(capture.sessionId, null);
+    assert.equal(rolledBack, true, `${failure}: the article cursor is given back`);
+    assert.equal(stopped, true, `${failure}: the shared audio is released`);
+    assert.match(alertText, reason);
+    assert.equal(capture.everReady, false);
+  }
+
+  // A pipeline that never comes up is given up on after a while, again without touching the server.
+  audio.failure = 'hang';
+  const timers = {};
+  global.setTimeout = (callback, ms) => {
+    if (ms === 10000 || ms === 375000) { timers[ms] = callback; return 999999; }
+    return nativeSetTimeout(callback, ms);
+  };
+  const sockets = FakeWebSocket.sockets.length;
+  rolledBack = false;
+  alertText = '';
+  const starting = capture.start('remote_microphone', 'test-token');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof timers[10000], 'function');
+  assert.equal(timers[375000], undefined);
+  timers[10000]();
+  await starting;
+  assert.equal(FakeWebSocket.sockets.length, sockets);
+  assert.equal(rolledBack, true);
+  assert.match(alertText, /逾時/);
+
+  // The attempt that timed out may still finish later, in the middle of the NEXT start (or fail much later): it must build and
+  // publish nothing, so the next start keeps its own context, node and audio.
+  for (const lateOutcome of ['resolve', 'reject']) {
+    audio.failure = null;
+    audio.late.length = audio.nodes.length = audio.contexts.length = 0;
+    audio.behaviours = ['late', 'late'];
+    const first = capture.start('remote_microphone', 'test-token');       // its worklet module is still loading
+    await new Promise(resolve => setImmediate(resolve));
+    timers[10000]();                                                      // ... and it times out
+    await first;
+    assert.equal(capture.sessionId, null);
+    const second = capture.start('remote_microphone', 'test-token');      // the user tries again
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(audio.late.length, 2);
+    audio.late[0][lateOutcome](new Error('the old module finally answered'));     // the abandoned attempt wakes up now
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(audio.nodes.length, 0, `${lateOutcome}: the abandoned attempt must not build a node`);
+    assert.ok(!capture.node, `${lateOutcome}: nothing is published for the second attempt yet`);
+    audio.late[1].resolve();                                              // the second attempt's own module
+    await second;
+    assert.equal(audio.nodes.length, 1);
+    assert.equal(capture.node, audio.nodes[0]);
+    assert.equal(capture.context, audio.contexts[1], `${lateOutcome}: the context is the second attempt's`);
+    assert.notEqual(capture.sessionId, null);
+    const next = FakeWebSocket.sockets.at(-1);
+    next.open();
+    await next.message({type: 'ready', next_sequence: 0});
+    assert.equal(JSON.parse(next.sent[1]).type, 'format');
+    assert.equal(audio.log.at(-1), 'connect');                            // the shared audio went into the second node
+    capture.cleanup();
+  }
+  global.setTimeout = nativeSetTimeout;
+}
+
+function installFakeAudio() {
+  // `behaviours` is consumed one entry per addModule call: 'late' makes that call wait until `late[n].resolve()` / `.reject()`.
+  const audio = {failure: null, log: [], behaviours: [], late: [], contexts: [], nodes: []};
+  global.AudioContext = class {
+    constructor() {
+      audio.log.push('context');
+      audio.contexts.push(this);
+      this.sampleRate = 48000;
+      this.destination = {};
+      this.audioWorklet = {addModule: async () => {
+        audio.log.push('addModule');
+        if (audio.behaviours.shift() === 'late') await new Promise((resolve, reject) => audio.late.push({resolve, reject}));
+        if (audio.failure === 'addModule') throw new Error("Unable to load a worklet's module.");
+        if (audio.failure === 'hang') await new Promise(() => {});
+      }};
+    }
+    async resume() {
+      audio.log.push('resume');
+      if (audio.failure === 'resume') throw new Error('The AudioContext was not allowed to start.');
+    }
+    createMediaStreamSource() {
+      audio.log.push('source');
+      return {connect() { audio.log.push('connect'); }};
+    }
+    close() {}
+  };
+  global.AudioWorkletNode = class {
+    constructor() {
+      audio.log.push('node');
+      if (audio.failure === 'node') throw new Error('AudioWorkletNode could not be created.');
+      this.port = {postMessage() {}};
+      audio.nodes.push(this);
+    }
+    connect() {}
+    disconnect() {}
+  };
+  global.URL.createObjectURL = () => 'blob:fake';
+  global.URL.revokeObjectURL = () => {};
+  return audio;
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

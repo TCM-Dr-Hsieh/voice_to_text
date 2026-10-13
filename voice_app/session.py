@@ -12,7 +12,12 @@ from .remote_audio import RemoteAudioSource
 from .alignment import AlignmentError, map_alignment, select_new_window
 from .config import Settings
 from .editing import changes
+from .script import to_traditional
 from .text import join_texts
+
+
+class StartCancelled(Exception):
+    """`Session.cancel()` was called while the audio was still opening: nothing was started."""
 
 
 @dataclass
@@ -28,6 +33,7 @@ class Segment:
     reason: str = ''
     alignment: list = field(default_factory=list)
     edits: list = field(default_factory=list)
+    added_conv: str = ''          # meeting mode: `added` in Traditional script (the text the speaker marks are placed on)
 
 
 @dataclass
@@ -91,16 +97,66 @@ class Session:
         self.recording_save_error = ''
         self.committed_end = -1.0
         self.writing_context_before = self.writing_context_after = ''
+        self.meeting = None            # a `Meeting` while the session transcribes a meeting
+        self._starting = False         # `start()` is waiting for the audio to open
+        self._opening = None           # the source being opened: not the session's yet, so `cancel()` has to know it
+        self._cancelling = None        # the cancel at work, if any: a second one joins it
+        self._start_cancelled = False
 
-    def start(self, settings: Settings, kind: str, device_id='', path=None, *, record_audio=False,
-              writing_context=None):
-        if self.active:
+    @property
+    def starting(self) -> bool:
+        return self._starting
+
+    async def start(self, settings: Settings, kind: str, device_id='', path=None, *, record_audio=False,
+                    writing_context=None, meeting=None):
+        """Open the audio and begin a run. The session (its segments, its meeting) only changes once the audio is really coming
+        in: a device that is busy or a file that cannot be decoded fails the start and leaves the last run as it was. Until the
+        source has either opened or failed the start keeps waiting (a slow device is not a failed one); `cancel()` ends the wait
+        with `StartCancelled`."""
+        if self.active or self._starting:
             raise ValueError('請先完成或取消目前工作。')
         settings.validate()
-        recording_path = reserve_recording_path(kind) if record_audio and kind in (
-            'microphone', 'loopback', 'remote_microphone', 'remote_system') else None
+        self._starting, self._start_cancelled = True, False
+        previous_status, self.status = self.status, '正在開啟音訊來源'
+        try:
+            recording_path = reserve_recording_path(kind) if record_audio and kind in (
+                'microphone', 'loopback', 'remote_microphone', 'remote_system') else None
+            source = None
+            try:
+                source = (RemoteAudioSource(kind, settings=settings, recording_path=recording_path)
+                          if kind in ('remote_microphone', 'remote_system') else
+                          AudioSource(kind, device_id, path, settings=settings, recording_path=recording_path))
+                self._opening = source
+                source.start()
+                try:
+                    await source.wait_open()
+                except RuntimeError:
+                    if not self._start_cancelled:
+                        raise
+                if self._start_cancelled:
+                    raise StartCancelled('已取消，音訊來源未啟動。')
+            except BaseException:
+                self.status = previous_status
+                if source is not None:
+                    await source.close()                   # the thread has to be over before its recording file can go
+                if recording_path:
+                    try:
+                        recording_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+            self._commit_start(settings, kind, source, recording_path, writing_context, meeting)
+        finally:
+            self._starting, self._opening = False, None
+
+    def _commit_start(self, settings, kind, source, recording_path, writing_context, meeting):
+        """The run begins: nothing in here awaits or fails."""
+        self.source = source
         self.settings = deepcopy(settings)
         self.writing_context_before, self.writing_context_after = writing_context or ('', '')
+        if self.meeting is not None and self.meeting is not meeting:
+            self.meeting.retire()                      # before this run replaces the segments and the recording it reports
+        self.meeting = meeting
         self.raw = self.corrected = self.preview = ''
         self.error = self.warning = ''
         self.segments = []
@@ -116,20 +172,10 @@ class Session:
         self.recording_path = recording_path
         self.recording_state = 'recording' if recording_path else ''
         self.recording_save_error = ''
-        self.source = (RemoteAudioSource(kind, settings=settings, recording_path=recording_path)
-                       if kind in ('remote_microphone', 'remote_system') else
-                       AudioSource(kind, device_id, path, settings=settings, recording_path=recording_path))
         self.active = self.processing = True
         self.status = '讀取音訊檔' if kind == 'file' else '錄音中，等待語音'
-        try:
-            self.source.start()
-        except Exception:
-            self.active = self.processing = False
-            self.recording_path = None
-            self.recording_state = ''
-            if recording_path:
-                recording_path.unlink(missing_ok=True)
-            raise
+        if self.meeting is not None:
+            self.meeting.attach(self)
         self.task = asyncio.create_task(self._run())
 
     def request_stop(self):
@@ -221,6 +267,12 @@ class Session:
                     self.failed_chunk = None
                     self.failed_alignment = False
                     self.failed_recognition = None
+            if self.meeting is not None:
+                self.status = '定稿說話者標記'
+                try:
+                    await self.meeting.end()
+                except Exception as exc:                # the transcript is complete whatever happens to the extras
+                    self.meeting.emit('meeting_end_failed', error=f'{type(exc).__name__}: {exc}')
             self.active = False
             self.status = (f'處理完成，{len(self.gaps)} 段音訊可能缺漏'
                            if self.gaps else '處理完成，所有音訊已定稿')
@@ -264,11 +316,12 @@ class Session:
         self.failed_recognition = recognized
         raw = recognized['text']
         units = map_alignment(raw, recognized['items'], chunk.start, chunk.duration)
-        added, _ = select_new_window(raw, units, self.committed_end)
+        added, selected = select_new_window(raw, units, self.committed_end)
+        added_conv = to_traditional(added) if self.meeting is not None else ''
         warning = ''
-        candidate = Segment(len(self.segments) + 1, chunk.start, end, raw, added, added,
+        candidate = Segment(len(self.segments) + 1, chunk.start, end, raw, added, added_conv or added,
                             time.monotonic() - started, warning, chunk.reason,
-                            [asdict(unit) for unit in units])
+                            [asdict(unit) for unit in units], added_conv=added_conv)
         recent_start = max(self.rolling_start, len(self.segments) - 2)
         recent = self.segments[recent_start:] + [candidate]
         before = [segment.corrected_tail for segment in recent]
@@ -307,8 +360,28 @@ class Session:
         self.preview = ''
         self.warning = warning
         self.status = '視窗已校稿，繼續錄音' if chunk.reason != 'stop' else '剩餘音訊已校稿'
+        if self.meeting is not None:
+            await self.meeting.after_commit(chunk, candidate, selected, added, [segment.index for segment in recent])
 
     async def cancel(self):
+        """Cancel the run (or the start that is opening its audio). One cancel at a time: another that comes while this one is still at
+        work (a double click on the button, the page going away, the shutdown) waits for it and gets its outcome, so the source is
+        closed and the meeting ended once, not once per caller. A cancel after that one has finished cancels whatever runs then."""
+        if self._cancelling is None or self._cancelling.done():
+            self._cancelling = asyncio.ensure_future(self._cancel())
+            self._cancelling.add_done_callback(lambda task: None if task.cancelled() else task.exception())   # (seen, if no one waits)
+        await asyncio.shield(self._cancelling)
+
+    async def _cancel(self):
+        if self._starting:                                  # a source still opening is not `self.source` yet: stop that one
+            self._start_cancelled = True
+            if self._opening is not None:
+                self._opening.cancelled.set()
+                self._opening.stop.set()
+            for _ in range(400):                            # until `start()` has closed it and given its recording file back
+                if not self._starting:
+                    break
+                await asyncio.sleep(0.02)
         was_active = self.active
         if self.source:
             self.source.cancelled.set()
@@ -321,6 +394,11 @@ class Session:
                 pass
         if self.source:
             await self.source.close()
+        if self.meeting is not None and was_active:
+            try:
+                await self.meeting.end()
+            except Exception as exc:
+                self.meeting.emit('meeting_end_failed', error=f'{type(exc).__name__}: {exc}')
         self.active = self.processing = False
         self.failed_chunk = None
         self.failed_alignment = False

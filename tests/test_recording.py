@@ -92,7 +92,7 @@ async def test_completed_recording_autosaves_paired_json_and_corrected_text(monk
                         lambda kind: reserve_recording_path(kind, tmp_path, datetime(2026, 9, 26)))
     monkeypatch.setattr(session_module, 'ModelAPI', FakeAPI)
     session = Session()
-    session.start(Settings(), 'microphone', 'fake', record_audio=True)
+    await session.start(Settings(), 'microphone', 'fake', record_audio=True)
     await asyncio.wait_for(session.task, 5)
     assert session.recording_state == 'complete'
     assert session.recording_path.name == '麥克風-20260926-001.wav'
@@ -125,7 +125,7 @@ async def test_cancel_or_asr_failure_keeps_partial_recording(monkeypatch, tmp_pa
     monkeypatch.setattr(session_module, 'ModelAPI',
                         lambda settings: FakeAPI(settings, fail=failure))
     session = Session()
-    session.start(Settings(), 'microphone', 'fake', record_audio=True)
+    await session.start(Settings(), 'microphone', 'fake', record_audio=True)
     if failure:
         await asyncio.wait_for(session.task, 5)
         assert session.failed_chunk is not None
@@ -159,7 +159,7 @@ async def test_audio_source_failure_marks_recording_incomplete(monkeypatch, tmp_
                         lambda kind: reserve_recording_path(kind, tmp_path, datetime(2026, 9, 26)))
     monkeypatch.setattr(session_module, 'ModelAPI', FakeAPI)
     session = Session()
-    session.start(Settings(), 'loopback', 'fake', record_audio=True)
+    await session.start(Settings(), 'loopback', 'fake', record_audio=True)
     await asyncio.wait_for(session.task, 5)
     assert session.recording_path.name == '電腦音訊-20260926-001.wav'
     assert session.recording_state == 'incomplete'
