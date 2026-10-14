@@ -115,8 +115,9 @@ def show_settings_dialog(state, stream_switch, tab='asr'):
                     ui.button('測試校稿', on_click=test_editor).props('outline')
             with ui.tab_panel(audio_tab).classes('gap-3 p-0'):
                 window = ui.number('音訊視窗長度 L（秒）', value=draft.window_seconds, min=5, max=30, step=1).classes('w-full')
-                overlap = ui.number('左側參考 Overlap Z（秒）', value=draft.overlap_seconds, min=0, max=27, step=0.25).classes('w-full')
-                ui.label('Z ≤ L−3，至少保留 3 秒新音訊。每隔 L−Z 秒產生一段辨識文字；重疊音訊只作參考，前一段已涵蓋的文字不重複插入。停止時處理不足 L 的尾段。').classes('muted text-sm')
+                overlap = ui.number('左側參考 Overlap Z（秒）', value=draft.overlap_seconds, min=0, max=29, step=0.25).classes('w-full')
+                ui.label('Z ≤ L−1，至少保留 1 秒新音訊；建議每次新增的音訊（L−Z）大於 3 秒：每隔 L−Z 秒就要完成一次辨識、對齊和校稿，'
+                         '太小時處理不及，即時錄音的待處理片段會累積，滿了就停止錄音。每隔 L−Z 秒產生一段辨識文字；重疊音訊只作參考，前一段已涵蓋的文字不重複插入。停止時處理不足 L 的尾段。').classes('muted text-sm')
                 context = ui.number('提供給校稿的前文長度', value=draft.context_chars, min=100, max=20000, step=100).classes('w-full')
                 timeout = ui.number('API 逾時（秒）', value=draft.timeout_seconds, min=5, max=600).classes('w-full')
                 streaming = ui.switch('串流顯示校稿預覽', value=draft.streaming)

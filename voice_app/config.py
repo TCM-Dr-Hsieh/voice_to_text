@@ -144,8 +144,8 @@ class Settings:
         self.editor.validate()
         self.translator.validate()
         self.meeting.validate()
-        if not math.isfinite(self.overlap_seconds) or not (0 <= self.overlap_seconds <= self.window_seconds - 3):
-            raise ValueError('左側參考 Overlap 須大於等於 0，且至少保留 3 秒新音訊（Z ≤ L−3）。')
+        if not math.isfinite(self.overlap_seconds) or not (0 <= self.overlap_seconds <= self.window_seconds - 1):
+            raise ValueError('左側參考 Overlap 須大於等於 0，且至少保留 1 秒新音訊（Z ≤ L−1）；建議 L−Z 大於 3 秒。')
         if not isinstance(self.context_chars, int) or not 100 <= self.context_chars <= 20000:
             raise ValueError('上下文長度須為 100–20000 的整數。')
         if not math.isfinite(self.timeout_seconds) or not 5 <= self.timeout_seconds <= 600:

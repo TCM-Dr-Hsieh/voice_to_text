@@ -364,7 +364,7 @@ def test_settings_roundtrip_and_validation(tmp_path):
     settings.save(path)
     assert Settings.load(path) == settings
     assert settings.editor.base_url.endswith('/v1')
-    settings.overlap_seconds = 10
+    settings.overlap_seconds = 11.5                                   # (window 12 s: more than L-1, less than one second of new audio)
     with pytest.raises(ValueError):
         settings.validate()
 

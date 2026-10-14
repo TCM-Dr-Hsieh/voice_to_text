@@ -22,6 +22,14 @@ def windows(seconds, block, *, length=12, overlap=1):
     return result
 
 
+def test_a_stride_of_one_second_cuts_a_window_every_second_and_covers_all_the_audio():
+    result = windows(9.5, 1600, length=5, overlap=4)
+    assert [chunk.start for chunk in result] == [0, 1, 2, 3, 4, 5]                       # [0,5] [1,6] [2,7] [3,8] [4,9], then the tail from 5
+    assert [chunk.reason for chunk in result] == ['window'] * 5 + ['stop']
+    assert all(chunk.duration == 5 for chunk in result[:5]) and result[-1].duration == 4.5
+    assert result[-1].start + result[-1].duration == 9.5                                  # nothing after the last sample is missing
+
+
 @pytest.mark.parametrize('block', [319, 1600, 300000])
 def test_fixed_windows_are_independent_of_input_blocks(block):
     result = windows(25, block)

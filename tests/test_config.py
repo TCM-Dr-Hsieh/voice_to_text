@@ -58,11 +58,15 @@ def test_window_must_exceed_overlap():
     Settings(window_seconds=9, overlap_seconds=4).validate()
     Settings(window_seconds=9, overlap_seconds=6).validate()
     Settings(window_seconds=30, overlap_seconds=27).validate()
+    Settings(window_seconds=9, overlap_seconds=8).validate()               # (a stride of 1 s: allowed, not advised)
+    Settings(window_seconds=30, overlap_seconds=29).validate()
     with pytest.raises(ValueError, match='window_seconds 須介於 5–30'):
         Settings(window_seconds=4.99, overlap_seconds=0).validate()
-    with pytest.raises(ValueError, match='至少保留 3 秒'):
-        Settings(window_seconds=9, overlap_seconds=6.01).validate()
-    with pytest.raises(ValueError, match='至少保留 3 秒'):
+    with pytest.raises(ValueError, match='至少保留 1 秒.*建議 L−Z 大於 3 秒'):
+        Settings(window_seconds=9, overlap_seconds=8.01).validate()
+    with pytest.raises(ValueError, match='至少保留 1 秒'):
+        Settings(window_seconds=5, overlap_seconds=4.5).validate()
+    with pytest.raises(ValueError, match='至少保留 1 秒'):
         Settings(window_seconds=5, overlap_seconds=-.01).validate()
 
 
