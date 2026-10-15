@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import secrets
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from .api import ModelAPI
 from .config import ROOT, Settings
+from .replay import NO_RECORDING, blocked_reason, register as register_replay, unregister as unregister_replay
 from .speaker import default_name
 from .speaker.palette import SPEAKER_COLORS
 from .speaker.service import SpeakerService
@@ -69,6 +71,9 @@ class Meeting:
         self.created = datetime.now().astimezone().isoformat()
         self.path = path or reserve_meeting_path()
         self.ended = False
+        self.replay_token = secrets.token_urlsafe(16)  # what the page must say to be given the audio of this meeting (see replay.py)
+        self.audio_path: Path | None = None            # the recording the replay is cut from
+        self.replay_blocked = NO_RECORDING             # why the audio cannot be replayed ('' = it can)
         self.events: list[dict] = []
         self.dirty: set[int] = set()
         self.reset = True                             # the next update tells the page to start from an empty view
@@ -105,6 +110,9 @@ class Meeting:
         self.session = session
         self._segments = session.segments
         self._source_kind = session.kind
+        self.audio_path = session.recording_path
+        self.replay_blocked = blocked_reason(session.kind, session.recording_path)
+        register_replay(self)
         self.speaker.start()
         self._autosave = asyncio.create_task(self._autosave_loop(), name='meeting-autosave')
         self.emit('meeting_started', source=session.kind, file=self.path.name)
@@ -143,6 +151,7 @@ class Meeting:
         if self._retired:
             return
         self._retired = True
+        unregister_replay(self)                           # its page now shows the next run: that audio is not asked for any more
         self._recording = self._recording_info()
         self.session = None
         try:
@@ -163,6 +172,7 @@ class Meeting:
         if self._closed:
             return
         self._closed = True
+        unregister_replay(self)
         if self._autosave is not None:
             self._autosave.cancel()
             await asyncio.gather(self._autosave, return_exceptions=True)
@@ -219,6 +229,7 @@ class Meeting:
         gids = speaker.tracker.group_ids
         return {'marking': speaker.active, 'names': {str(g): speaker.name_of(g) for g in gids}, 'unknown': '不明', 'voice': '語音',
                 'background': '背景', 'palette': len(SPEAKER_COLORS),
+                'replay': {'token': self.replay_token, 'blocked': self.replay_blocked},
                 'tnames': {str(g): translator.label_for(g) for g in gids},
                 'tunknown': translator.names.unknown, 'tvoice': translator.names.voice}
 
@@ -237,7 +248,8 @@ class Meeting:
         count = self.segment_count()
         revisable = not self.ended and index > count - REVISABLE
         runs = self.speaker.runs(segment)
-        row = {'i': index, 'rev': revisable, 'runs': [{'g': r.gid, 't': r.text, 's': r.source} for r in runs]}
+        start = segment.owned_start if getattr(segment, 'owned_start', None) is not None else segment.start
+        row = {'i': index, 'rev': revisable, 't': round(start, 2), 'runs': [{'g': r.gid, 't': r.text, 's': r.source} for r in runs]}
         result = self.translator.visible(index)
         draft = self.translator.draft_text(index)
         if result is not None and not (result.error and draft):

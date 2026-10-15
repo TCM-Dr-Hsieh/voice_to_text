@@ -196,4 +196,62 @@ view.update({labels: {...labels, marking: false}});                             
 assert.equal(right(1).textContent, 'Voice#2Third.');
 view.update({labels});
 
+// 13. the number of a segment plays what was said there again (the player is replay.js; here a stand-in that records what it is told)
+const opened = [], synced = [];
+window.meetingReplay = {open: info => opened.push(info), sync: replay => synced.push(replay)};
+const replayLabels = {...labels, replay: {token: 'tok-1', blocked: ''}};
+view.update({reset: true, labels: replayLabels, rows: [
+  {i: 1, rev: false, t: 0, runs: [{g: 0, t: '甲。', s: 'voice'}, {g: 1, t: '乙。', s: 'voice'}],
+   tr: {st: 'ok', err: '', runs: [{g: 0, t: 'A.'}, {g: 1, t: 'B.'}]}},
+  {i: 2, rev: false, t: 9, runs: [{g: 1, t: '丙。', s: 'voice'}], tr: {st: 'draft', err: '', runs: [{g: null, t: 'C.'}]}},
+  {i: 3, rev: false, t: 12.5, runs: [{g: null, t: '丁。', s: 'background'}], tr: {st: 'error', err: 'down', runs: []}},
+]});
+const number = line => line.children[0];
+assert.equal(has(number(left(0).children[0]), 'm-play'), true);
+assert.equal(has(number(left(0).children[1]), 'm-play'), false);                   // only the first line of a segment has the number
+assert.equal(number(left(0).children[0]).title, '點擊回聽這一段（從這裡起 30 秒）');
+number(left(1).children[0]).listeners.click[0]();                                  // the transcript side ...
+number(right(1).children[0]).listeners.click[0]();                                 // ... and the translation side (a draft) play the same
+number(right(2).children[0]).listeners.click[0]();                                 // (a translation that failed: the audio is still there)
+number(right(0).children[0]).listeners.click[0]();
+assert.deepEqual(opened, [{start: 9, i: 2, token: 'tok-1', blocked: ''}, {start: 9, i: 2, token: 'tok-1', blocked: ''},
+                          {start: 12.5, i: 3, token: 'tok-1', blocked: ''}, {start: 0, i: 1, token: 'tok-1', blocked: ''}]);
+number(left(1).children[0]).listeners.keydown[0]({key: 'Enter'});
+number(left(1).children[0]).listeners.keydown[0]({key: 'a'});
+assert.equal(opened.length, 5);                                                    // the Enter key plays it, another key does not
+assert.deepEqual(view.rowAt(10), {i: 2, t: 9, label: '語音#2', text: 'Speaker-002: 丙。'});
+assert.deepEqual(view.rowAt(0.05), {i: 1, t: 0, label: '語音#1', text: '王主持人: 甲。\nSpeaker-002: 乙。'});
+assert.equal(view.rowAt(13).text, '背景: 丁。');
+assert.equal(view.rowAt(-1), null);
+view.scroller.getBoundingClientRect = () => ({top: 100, bottom: 600});
+rows()[1].getBoundingClientRect = () => ({top: 900, bottom: 940});                // the row that plays is below what the view shows
+view.scroller.scrollTop = 0;
+view.setPlaying(2);
+assert.equal(has(rows()[1], 'm-playing'), true);
+assert.equal(view.scroller.scrollTop, 760);                                        // it is brought into view (900 - 100 - 40 from the top)
+view.setPlaying(2);
+assert.equal(view.scroller.scrollTop, 760);                                        // the same row again: nothing moves
+rows()[2].getBoundingClientRect = () => ({top: 300, bottom: 340});                 // a row that is in view is not scrolled to
+view.setPlaying(3);
+assert.equal(view.scroller.scrollTop, 760);
+view.setPlaying(2);
+view.setPlaying(3);
+assert.deepEqual([0, 1, 2].map(k => has(rows()[k], 'm-playing')), [false, false, true]);   // one row at a time
+view.setPlaying(null);
+assert.deepEqual([0, 1, 2].map(k => has(rows()[k], 'm-playing')), [false, false, false]);
+view.setPlaying(99);                                                               // a row that is not there: nothing plays
+assert.equal(view.playing, null);
+view.update({labels: {...replayLabels, replay: {token: 'tok-2', blocked: ''}}});   // another meeting: the player is told
+assert.deepEqual(synced.at(-1), {token: 'tok-2', blocked: ''});
+// a meeting whose audio cannot be replayed: the number says why and still opens the player, which says it
+view.update({labels: {...replayLabels, replay: {token: 'tok-2', blocked: '這個音訊來源無法回聽'}}});
+assert.equal(number(left(0).children[0]).title, '這個音訊來源無法回聽');
+number(left(0).children[0]).listeners.click[0]();
+assert.deepEqual(opened.at(-1), {start: 0, i: 1, token: 'tok-2', blocked: '這個音訊來源無法回聽'});
+// without what the server sends for it (an older server, a row without its start) the numbers are plain
+view.update({reset: true, labels, rows: [{i: 1, rev: false, t: 0, runs: [{g: 0, t: '甲。', s: 'voice'}]}]});
+assert.equal(has(number(left(0).children[0]), 'm-play'), false);
+view.update({labels: replayLabels, rows: [{i: 1, rev: false, runs: [{g: 0, t: '甲。', s: 'voice'}]}]});
+assert.equal(has(number(left(0).children[0]), 'm-play'), false);                   // (no start time: nothing to play from)
+
 console.log('meeting view smoke test passed');

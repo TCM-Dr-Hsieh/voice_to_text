@@ -18,6 +18,7 @@ from .audio import devices
 from .config import ROOT, Settings, resolve_path, shared_mode, source_allowed
 from .meeting import Meeting
 from .remote_audio import REMOTE_PAGES, RemoteAudioSource
+from .replay import register_replay_routes
 from .session import Session, StartCancelled
 from .speaker.palette import palette_css
 from .speaker.embedder import load_embedder
@@ -36,10 +37,14 @@ app.add_static_file(local_file=ROOT / 'voice_app' / 'writing.js',
                     url_path='/writing.js', max_cache_age=0)
 app.add_static_file(local_file=ROOT / 'voice_app' / 'meeting.js',
                     url_path='/meeting.js', max_cache_age=0)
+app.add_static_file(local_file=ROOT / 'voice_app' / 'replay.js',
+                    url_path='/replay.js', max_cache_age=0)
+register_replay_routes(app)
 ui.add_head_html('<script src="/opencc.full.js?v=1.4.2"></script>'
                  '<script src="/script_converter.js?v=3"></script>'
                  '<script src="/writing.js?v=7"></script>'
-                 '<script src="/meeting.js?v=1"></script>', shared=True)
+                 '<script src="/meeting.js?v=3"></script>'
+                 '<script src="/replay.js?v=1"></script>', shared=True)
 
 
 def writing_commit_ready(session: Session) -> bool:
@@ -52,6 +57,32 @@ def writing_in_play(state, session: Session) -> bool:
     the audio opens): `session` is then still the last run, a finished one, and its text must neither be shown nor inserted again.
     (`state.loading` says nothing of this: a remote recording holds it for as long as it runs.)"""
     return bool(state.writing_pending and not state.writing_starting and not session.starting)
+
+
+CLOSE_REPLAY = 'window.meetingReplay && window.meetingReplay.close()'
+
+
+async def close_replay() -> None:
+    """Close the replay window of the page and stop its sound: when a run starts (its audio would record the sound of the replay) and when
+    the meeting mode is left (the window belongs to the meeting view). A page that does not answer is not waited for."""
+    try:
+        await ui.run_javascript(CLOSE_REPLAY, timeout=0.5)
+    except Exception:
+        pass
+
+
+async def show_meeting_mode(state, controls, article_card) -> None:
+    """Show the page as the meeting mode (`state.meeting_mode`) says: the meeting view or the article, and tell the article editor."""
+    widgets = state.meeting_widgets
+    article_card.set_visibility(not state.meeting_mode)
+    widgets.card.set_visibility(state.meeting_mode)
+    controls.meeting_button.set_text('✓ 會議模式' if state.meeting_mode else '會議模式')
+    if state.meeting_mode:
+        controls.record_switch.set_value(True)
+        await ui.run_javascript('window.writing.setMode(false)')
+    else:
+        await close_replay()                       # the replay window is part of the meeting view
+        await ui.run_javascript(f'window.writing.setMode(true, {state.settings.context_chars})')
 
 
 def cancel_start(state, session: Session) -> bool:
@@ -87,6 +118,7 @@ async def launch_run(state, session: Session, kind: str, writing_context) -> Non
     state.start_cancelled = False
     meeting = None
     try:
+        await close_replay()                                   # its sound would be recorded into the run that starts now
         state.settings.validate()
         session.status = '載入本機 ASR 與 ForcedAligner，準備辨識'
         async with ModelAPI(state.settings) as api:
@@ -179,6 +211,27 @@ body {background:#f3f5f7;color:#203044;font-family:"Segoe UI","Microsoft JhengHe
 .m-right {border-left:1px solid #eef2f6;background:#fbfcfd;}
 .m-line {border-left:3px solid transparent;padding-left:6px;}
 .m-n {color:#8a9bb0;font-size:12px;margin-right:8px;}
+.m-n.m-play {cursor:pointer;border-radius:4px;padding:0 2px;margin-left:-2px;}
+.m-n.m-play:hover {color:#1b4332;background:#dcebe3;text-decoration:underline;}
+.m-row.m-playing {background:#e6f1ea;box-shadow:inset 3px 0 0 #2d6a4f;}
+.replay-panel {position:fixed;right:24px;bottom:24px;width:400px;max-width:calc(100vw - 20px);z-index:3000;background:white;border:1px solid #b9c9c1;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.25);font:14px/1.5 "Segoe UI","Microsoft JhengHei",sans-serif;}
+.replay-head {display:flex;align-items:center;gap:6px;padding:5px 8px 5px 12px;background:#eaf1ed;border-radius:12px 12px 0 0;cursor:move;user-select:none;}
+.replay-title {font-weight:600;color:#1b4332;}
+.replay-body {padding:10px 14px;display:flex;flex-direction:column;gap:8px;}
+.replay-now {font-family:Consolas,monospace;font-size:12px;color:#52665d;min-height:16px;}
+.replay-text {min-height:36px;max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7;user-select:text;background:#f7faf8;border-radius:8px;padding:6px 8px;}
+.replay-controls {display:flex;align-items:center;gap:8px;}
+.replay-bar {flex:1 1 auto;min-width:60px;accent-color:#2d6a4f;cursor:pointer;}
+.replay-time {font-family:Consolas,monospace;font-size:12px;color:#52665d;white-space:nowrap;}
+.replay-btn {display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;padding:0;border:0;border-radius:50%;background:transparent;cursor:pointer;color:#1b4332;}
+.replay-btn:hover {background:#dcebe3;}
+.replay-btn .material-icons {font-size:22px;}
+.replay-start {display:flex;align-items:center;gap:6px;font-size:13px;color:#52665d;}
+.replay-start-input {width:84px;padding:2px 6px;border:1px solid #b9c9c1;border-radius:6px;font-family:Consolas,monospace;}
+.replay-go {padding:3px 10px;border:1px solid #2d6a4f;border-radius:6px;background:#fff;color:#2d6a4f;cursor:pointer;font-size:13px;}
+.replay-go:hover {background:#2d6a4f;color:#fff;}
+.replay-msg {color:#b3261e;font-size:13px;display:none;}
+.replay-note {color:#7a8a83;font-size:12px;}
 .m-who {font-weight:600;color:#285f91;}
 .m-unknown .m-who {color:#8a9bb0;font-weight:400;}
 .m-bg {color:#8a9bb0;}
@@ -290,15 +343,7 @@ def build_page():
     state.prepare_meeting = prepare_meeting
 
     async def apply_meeting_mode():
-        widgets = state.meeting_widgets
-        article_card.set_visibility(not state.meeting_mode)
-        widgets.card.set_visibility(state.meeting_mode)
-        controls.meeting_button.set_text('✓ 會議模式' if state.meeting_mode else '會議模式')
-        if state.meeting_mode:
-            controls.record_switch.set_value(True)
-            await ui.run_javascript('window.writing.setMode(false)')
-        else:
-            await ui.run_javascript(f'window.writing.setMode(true, {state.settings.context_chars})')
+        await show_meeting_mode(state, controls, article_card)
 
     async def toggle_meeting():
         if session.active or state.loading or state.writing_pending:

@@ -175,6 +175,37 @@ async function main() {
   assert.equal(audio.log.filter(entry => entry === 'source').length, 1);
   capture.cleanup();
 
+  // A new start closes the replay window of the meeting view first: its sound would be recorded into the run that starts (the shared
+  // system audio captures it for certain). A start that is refused because one is running, and a reconnect, leave it alone.
+  const replayCalls = [];
+  window.meetingReplay = {close: () => replayCalls.push('close')};
+  await capture.start('remote_microphone', 'test-token');
+  assert.deepEqual(replayCalls, ['close'], alertText);
+  await capture.start('remote_microphone', 'test-token');                  // one is running: refused
+  assert.deepEqual(replayCalls, ['close']);
+  capture.openSocket(true);                                                // a reconnect of the same run
+  assert.deepEqual(replayCalls, ['close']);
+  capture.cleanup();
+  await capture.start('remote_microphone', 'test-token');
+  assert.deepEqual(replayCalls, ['close', 'close']);                       // the next run closes it again
+  capture.cleanup();
+  delete window.meetingReplay;
+  await capture.start('remote_microphone', 'test-token');                  // a page without the replay script still starts
+  assert.notEqual(capture.sessionId, null);
+  capture.cleanup();
+  // A player that cannot be closed (its audio or its window is in a state that throws) must not stop a run from starting, nor leave
+  // the start "pending" for ever, which would refuse every start after it.
+  window.meetingReplay = {close: () => { throw new Error('the player is broken'); }};
+  await capture.start('remote_microphone', 'test-token');
+  assert.equal(capture.pending, false, alertText);
+  assert.notEqual(capture.sessionId, null, alertText);
+  capture.cleanup();
+  await capture.start('remote_microphone', 'test-token');                  // and the next start is not refused either
+  assert.equal(capture.pending, false);
+  assert.notEqual(capture.sessionId, null);
+  capture.cleanup();
+  delete window.meetingReplay;
+
   for (const [failure, reason] of [['addModule', /worklet/], ['node', /AudioWorkletNode/], ['resume', /not allowed/]]) {
     const sockets = FakeWebSocket.sockets.length;
     audio.failure = failure;
@@ -285,4 +316,4 @@ function installFakeAudio() {
   return audio;
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1; });
+main().catch(error => { console.error(error); process.exit(1); });          // (at once: a timer left by the failed step would keep the process for minutes)

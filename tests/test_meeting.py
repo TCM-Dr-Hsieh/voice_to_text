@@ -212,7 +212,8 @@ async def test_the_bilingual_text_says_where_in_the_audio_each_segment_is_but_th
         assert [segment.owned_start for segment in session.segments[:3]] == [0.0, 6.0, 9.0]    # (windows of 6 s every 3 s)
         update = meeting.drain()
         assert update and update['rows']
-        assert 'span' not in json.dumps(update) and 'owned_start' not in json.dumps(update)   # the page is not given times
+        assert [row['t'] for row in update['rows']] == [round(segment.owned_start, 2) for segment in session.segments]      # (what the page replays from)
+        assert 'span' not in json.dumps(update) and 'owned_start' not in json.dumps(update)   # (the start is sent as `t`; no field of the exported text's)
         many = next(index for index in range(1, len(session.segments) + 1) if len(meeting.speaker.runs(session.segments[index - 1])) > 1)
         at = next(i for i, line in enumerate(lines) if line.startswith(f'語音#{many}('))
         head = lines[at].split(' ')[0]

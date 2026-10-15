@@ -88,6 +88,9 @@ class RemoteCapture {
     this.stopping = false;
     this.captureError = '';
     try {
+      // The replay window of the meeting view goes first: its sound would be recorded into the run that starts now (a reconnect does not
+      // come here). A player that cannot close must not stop the run, and must not leave this start pending for ever.
+      try { window.meetingReplay?.close(); } catch (error) { /* nothing to do about it here */ }
       const writingContext = window.writing?.mode ? window.writing.begin(window.writing.contextChars) : null;
       this.writingPrepared = !!writingContext;
       if (!navigator.mediaDevices) throw new Error('此瀏覽器需要 HTTPS 才能擷取遠端音訊。');

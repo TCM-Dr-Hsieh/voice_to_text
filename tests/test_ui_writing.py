@@ -10,7 +10,7 @@ import voice_app.session as session_module
 import voice_app.ui as page
 from voice_app.config import Settings
 from voice_app.session import Session
-from voice_app.ui import cancel_run, cancel_start, launch_run
+from voice_app.ui import CLOSE_REPLAY, cancel_run, cancel_start, close_replay, launch_run, show_meeting_mode
 from tests.test_meeting_robustness import scripted_run
 
 
@@ -90,6 +90,10 @@ class SlowModels:
 
     async def prepare_asr(self):
         await SlowModels.release_event.wait()
+
+
+def rollbacks(codes):
+    return [code for code in codes if code != CLOSE_REPLAY]
 
 
 def starting_page(monkeypatch):
@@ -214,6 +218,8 @@ async def test_a_cancel_while_the_audio_opens_reaches_the_source_even_when_the_a
     seen_by_the_page = []
 
     async def stuck_rollback(code, **kwargs):                         # the browser does not answer (it is gone, or slow)
+        if code == CLOSE_REPLAY:
+            return
         for _ in range(100):
             if opened and opened[0] is not None and session._start_cancelled:
                 seen_by_the_page.append('the source was told to stop')
@@ -243,6 +249,8 @@ async def test_a_cancel_of_a_recording_stops_it_even_when_the_article_cannot_be_
     cancel_aware(monkeypatch, endless=True)
 
     async def failing_rollback(code, **kwargs):
+        if code == CLOSE_REPLAY:
+            return
         raise ConnectionError('the page went away')
 
     monkeypatch.setattr(page.ui, 'run_javascript', failing_rollback)
@@ -260,9 +268,9 @@ async def test_a_cancel_gives_the_article_back_once(monkeypatch):
     cancel_aware(monkeypatch, endless=True)
     await launch_run(state, session, 'file', None)
     await cancel_run(state, session)
-    assert rolled_back == ['window.writing.rollback()'] and not state.writing_pending and not session.active
+    assert rollbacks(rolled_back) == ['window.writing.rollback()'] and not state.writing_pending and not session.active
     await cancel_run(state, session)                                  # a second press has nothing left to give back
-    assert rolled_back == ['window.writing.rollback()']
+    assert rollbacks(rolled_back) == ['window.writing.rollback()']
 
 
 def counting(monkeypatch, *, close_fails=False):
@@ -314,7 +322,7 @@ async def test_two_cancels_at_once_close_the_run_once(monkeypatch):
 async def test_two_presses_of_the_cancel_button_at_once_close_the_run_once_and_give_the_article_back_once(monkeypatch):
     state, session, closed, ended, rolled_back, _ = await running_page(monkeypatch)
     await asyncio.gather(cancel_run(state, session), cancel_run(state, session))
-    assert len(closed) == 1 and len(ended) == 1 and rolled_back == ['window.writing.rollback()'] and not session.active
+    assert len(closed) == 1 and len(ended) == 1 and rollbacks(rolled_back) == ['window.writing.rollback()'] and not session.active
 
 
 @pytest.mark.asyncio
@@ -336,3 +344,59 @@ async def test_a_cancel_after_another_has_finished_cancels_the_next_run(monkeypa
     assert session.active and len(sources) == 2
     await session.cancel()
     assert closed == sources and not session.active
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_starts_closes_the_replay_window_first_so_its_sound_is_not_recorded_into_it(monkeypatch):
+    state, session, opened, told = starting_page(monkeypatch)
+    SlowModels.release_event.set()
+    await launch_run(state, session, 'file', None)
+    assert told[0] == CLOSE_REPLAY and not any(code == CLOSE_REPLAY for code in told[1:])        # before the audio is opened, once
+    await asyncio.wait_for(session.task, 20)
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_does_not_answer_the_close_does_not_stop_a_run_from_starting(monkeypatch):
+    state, session, opened, told = starting_page(monkeypatch)
+    SlowModels.release_event.set()
+
+    async def silent(code, **kwargs):
+        raise TimeoutError('the browser did not answer')
+
+    monkeypatch.setattr(page.ui, 'run_javascript', silent)
+    await close_replay()                                                                          # (harmless by itself)
+    await launch_run(state, session, 'file', None)
+    assert len(opened) == 1 and session.error == ''                                              # the run started all the same
+    await asyncio.wait_for(session.task, 20)
+
+
+def meeting_mode_page(monkeypatch, *, on):
+    told = []
+
+    def run_javascript(code, **kwargs):
+        told.append(code)
+
+        class Sent:
+            def __await__(self):
+                yield from []
+        return Sent()
+
+    monkeypatch.setattr(page.ui, 'run_javascript', run_javascript)
+    shown = {}
+    widget = lambda name: SimpleNamespace(set_visibility=lambda value: shown.__setitem__(name, value), set_text=lambda text: None,
+                                          set_value=lambda value: shown.__setitem__(name + ' value', value))
+    controls = SimpleNamespace(meeting_button=widget('button'), record_switch=widget('record'))
+    state = page.PageState(SimpleNamespace(), Settings(), meeting_mode=on, meeting_widgets=SimpleNamespace(card=widget('meeting')))
+    return state, controls, widget('article'), told, shown
+
+
+@pytest.mark.asyncio
+async def test_leaving_the_meeting_mode_closes_the_replay_window_and_entering_it_does_not(monkeypatch):
+    state, controls, article, told, shown = meeting_mode_page(monkeypatch, on=False)           # the mode has just been switched off
+    await show_meeting_mode(state, controls, article)
+    assert CLOSE_REPLAY in told and any('setMode(true' in code for code in told)
+    assert shown['article'] is True and shown['meeting'] is False
+    state, controls, article, told, shown = meeting_mode_page(monkeypatch, on=True)
+    await show_meeting_mode(state, controls, article)
+    assert CLOSE_REPLAY not in told and 'window.writing.setMode(false)' in told
+    assert shown['article'] is False and shown['meeting'] is True and shown['record value'] is True

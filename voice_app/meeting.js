@@ -7,6 +7,7 @@ class MeetingView {
     this.order = [];                // the numbers present, ascending
     this.labels = {marking: true, names: {}, unknown: '不明', voice: '語音', background: '背景', palette: 10, tnames: {}, tunknown: 'Unknown',
                    tvoice: 'Voice'};
+    this.playing = null;            // the row the replay is playing now
     this.script = 'original';       // display-only Traditional/Simplified conversion
     this.host = null;
     this.scroller = null;
@@ -60,12 +61,20 @@ class MeetingView {
     return map[String(g)] ?? this.labels.names[String(g)] ?? `Speaker-${String(g + 1).padStart(3, '0')}`;
   }
 
-  line(prefix, who, mark, text, cls, act, tip) {
+  line(prefix, who, mark, text, cls, act, tip, play) {
     const line = document.createElement('div');
     line.className = 'm-line' + (cls ? ' ' + cls : '');
     const number = document.createElement('span');
     number.className = 'm-n';
     number.textContent = prefix;
+    if (play && prefix) {                          // the number of a segment plays what was said there again
+      number.classList.add('m-play');
+      number.title = play.tip;
+      number.tabIndex = 0;
+      number.setAttribute('role', 'button');
+      number.addEventListener('click', play.open);
+      number.addEventListener('keydown', event => { if (event.key === 'Enter') play.open(event); });
+    }
     const body = document.createElement('span');
     body.className = 'm-text';
     body.textContent = text;
@@ -88,6 +97,50 @@ class MeetingView {
     return line;
   }
 
+  replayFor(data) {
+    // what a click on the number of this row does: the player gets where the row starts and the token of this meeting; `blocked` is
+    // the reason the audio cannot be replayed ('' when it can), which the player then says
+    const replay = this.labels.replay;
+    if (!replay || typeof data.t !== 'number') return null;
+    return {tip: replay.blocked || '點擊回聽這一段（從這裡起 30 秒）',
+            open: () => globalThis.window?.meetingReplay?.open({start: data.t, i: data.i, token: replay.token, blocked: replay.blocked})};
+  }
+
+  rowAt(seconds) {
+    // the row that is playing at this audio time: the last one that starts at or before it, with its text as the reader sees it
+    let found = null;
+    for (const i of this.order) {
+      const data = this.rows.get(i).data;
+      if (typeof data.t === 'number' && data.t <= seconds) found = data;
+    }
+    if (!found) return null;
+    const marking = this.labels.marking !== false;
+    const lines = found.runs.map(run => {
+      const who = !marking ? '' : (run.s === 'background' ? this.labels.background : this.name(this.labels.names, run.g, this.labels.unknown));
+      return (who ? who + ': ' : '') + this.convert(run.t);
+    });
+    return {i: found.i, t: found.t, label: `${this.labels.voice}#${found.i}`, text: lines.join('\n')};
+  }
+
+  setPlaying(i) {
+    if (this.playing === i) return;
+    const before = this.rows.get(this.playing);
+    if (before) before.el.classList.toggle('m-playing', false);
+    const now = this.rows.get(i);
+    if (now) {
+      now.el.classList.toggle('m-playing', true);
+      this.reveal(now.el);
+    }
+    this.playing = now ? i : null;
+  }
+
+  reveal(el) {
+    // bring the row that is playing into the visible part of the view (the view itself, not the page); while the reader follows the
+    // replay the view no longer follows the newest row, which is what it is for
+    const row = el.getBoundingClientRect?.(), view = this.scroller?.getBoundingClientRect?.();
+    if (row && view && (row.top < view.top || row.bottom > view.bottom)) this.scroller.scrollTop += row.top - view.top - 40;
+  }
+
   mark(i, r, t, to) {
     // tell the server: sentence run r of segment i (as shown: t) is / is not background talk
     if (typeof emitEvent === 'function') emitEvent('meeting_background', {i, r, t, to});
@@ -99,6 +152,7 @@ class MeetingView {
     right.replaceChildren();
     left.classList.toggle('m-rev', !!data.rev);
     const marking = this.labels.marking !== false;
+    const play = this.replayFor(data);
     data.runs.forEach((run, k) => {
       const background = run.s === 'background';
       const mark = run.s === 'text' || run.s === 'text2' ? '*' : '';
@@ -107,23 +161,24 @@ class MeetingView {
       const to = background ? false : (run.g === null ? true : null);
       const act = marking && to !== null ? () => this.mark(data.i, k, run.t, to) : null;
       const tip = to === false ? '點一下：這不是背景，要翻譯' : '點一下：標成背景（灰色、不翻譯）';
-      left.append(this.line(k === 0 ? `${this.labels.voice}#${data.i}` : '', who, mark, this.convert(run.t), this.tone(run.g, background), act, tip));
+      left.append(this.line(k === 0 ? `${this.labels.voice}#${data.i}` : '', who, mark, this.convert(run.t), this.tone(run.g, background), act, tip,
+                            k === 0 ? play : null));
     });
     const tr = data.tr;
     right.classList.toggle('m-stale', !!tr && tr.st === 'stale');
     right.classList.toggle('m-rev', !!tr && tr.st === 'draft' && !!data.rev);       // a draft of the newest rows: it may still change
     if (!tr) return;
     if (tr.st === 'draft') {                       // one text for the segment, no speakers (they are not settled yet)
-      right.append(this.line(`${this.labels.tvoice}#${data.i}`, '', '', tr.runs.map(run => run.t).join(' '), ''));
+      right.append(this.line(`${this.labels.tvoice}#${data.i}`, '', '', tr.runs.map(run => run.t).join(' '), '', null, '', play));
       return;
     }
     if (tr.st === 'error') {
-      right.append(this.line(`${this.labels.tvoice}#${data.i}`, '', '', `（翻譯失敗）${tr.err || ''}`, 'm-error'));
+      right.append(this.line(`${this.labels.tvoice}#${data.i}`, '', '', `（翻譯失敗）${tr.err || ''}`, 'm-error', null, '', play));
       return;
     }
     tr.runs.filter(run => run.t).forEach((run, k) => {
       const who = marking ? this.name(this.labels.tnames, run.g, this.labels.tunknown) : '';
-      right.append(this.line(k === 0 ? `${this.labels.tvoice}#${data.i}` : '', who, '', run.t, this.tone(run.g, false)));
+      right.append(this.line(k === 0 ? `${this.labels.tvoice}#${data.i}` : '', who, '', run.t, this.tone(run.g, false), null, '', play));
     });
   }
 
@@ -141,12 +196,13 @@ class MeetingView {
 
   update(payload) {
     if (!this.ensure()) return false;
-    if (payload.reset) this.clear();
+    if (payload.reset) { this.clear(); this.playing = null; }
     const bottom = this.scroller.scrollHeight - this.scroller.scrollTop - this.scroller.clientHeight < 60;
     let relabel = false;
     if (payload.labels && JSON.stringify(payload.labels) !== JSON.stringify(this.labels)) {
       this.labels = payload.labels;
       relabel = true;
+      globalThis.window?.meetingReplay?.sync(this.labels.replay);
     }
     for (const data of payload.rows || []) {
       let entry = this.rows.get(data.i);
